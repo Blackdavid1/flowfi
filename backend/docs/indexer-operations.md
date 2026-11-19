@@ -3,10 +3,11 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, the indexer metrics, and the
-blue-green database connection cutover procedure. It is written for operators
-and on-call engineers. All public interfaces described here are additive;
-existing endpoints and configuration keys keep working unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, the
+blue-green database connection cutover procedure, and the multi-region read
+failover runbook. It is written for operators and on-call engineers. All
+public interfaces described here are additive; existing endpoints and
+configuration keys keep working unless noted.
 
 ---
 
@@ -167,123 +168,133 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the lease is rejected by the same fencing check that guards cursor writes.
+- **Fencing still applies.** The advisory lock is layered on top of the lease
+  fencing described in §1; a stale owner cannot advance the cursor even if it
+  somehow acquires the lock.
 
 ---
 
-## 4. Blue-green database connection cutover
+## 4. Multi-region read failover runbook
 
-### Objective
+This section covers failing **read traffic** over between regional
+deployments while preserving network identity and making stale data visible.
+Writes are **not** failed over (see §4.5).
 
-Move application instances (API and indexer worker) between database endpoints
-during maintenance **without routing writes to an unverified target**. The
-cutover is blue-green: the current endpoint (blue) keeps serving until the
-target endpoint (green) passes readiness checks, and a single rollback path
-returns traffic to blue if any check fails.
+### 4.1 Topology and network identity
 
-### Readiness checks (must all pass before routing writes)
+- Each region runs a full backend deployment (API + read replica of the
+  primary database) behind a regional load balancer.
+- A global DNS/edge layer routes read traffic to the **active read region**.
+  The active region is a single named target; clients always resolve the same
+  hostname, so **network identity (hostname, TLS certificate, and API base
+  URL) is preserved** across failover. No client reconfiguration is required.
+- The **primary region** owns writes and the indexer lease (§1). Secondary
+  regions serve reads from their replica only.
 
-Run these against the **target (green)** endpoint before switching:
+### 4.2 Promotion conditions (secondary → active read region)
 
-1. **Reachability.** `pg_isready -h <green-host> -p <green-port>` succeeds.
-2. **Schema parity.** The target reports the same applied migration version as
-   the current endpoint (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`).
-3. **Replication lag.** If green is a replica being promoted, lag is below the
-   configured threshold (`pg_last_wal_receive_lsn()` vs. `pg_last_wal_replay_lsn()`).
-4. **Write probe.** A transaction-scoped probe write to a scratch table
-   succeeds and is rolled back; no application data is mutated.
-5. **Lease sanity.** The indexer lease table is present and readable on green
-   so the worker can re-acquire ownership after cutover.
+Promote a secondary region to serve reads only when **all** of the following
+hold:
 
-If any check fails, **do not cut over**; keep blue serving and investigate.
+1. **Primary read health degraded beyond threshold.** Primary read error rate
+   exceeds the configured threshold (default: > 5% of read requests over a
+   5-minute window) **or** primary read p99 latency exceeds the threshold
+   (default: > 2s over 5 minutes), sustained for at least two consecutive
+   evaluation windows.
+2. **Replication lag within bound.** The candidate secondary's replication lag
+   is at or below the configured bound (default: ≤ 30s behind primary).
+3. **Secondary verified healthy.** The candidate secondary passes its read
+   health check (error rate and latency within thresholds) and can reach its
+   replica.
 
-### Cutover procedure (operator commands)
+If any condition is unmet, do **not** promote; keep serving from the current
+active region and escalate.
 
-1. **Pause the worker** so no cursor writes race the switch. The worker stops
-   advancing the cursor and releases ownership locally; in-flight polls finish
-   or are cancelled per the graceful-shutdown policy.
-   ```
-   kubectl -n <ns> scale deploy/indexer-worker --replicas=0
-   ```
-2. **Drain the API.** Remove API pods from the load balancer and wait for
-   in-flight requests to complete (connection draining), so no request is
-   mid-transaction during the switch.
-   ```
-   kubectl -n <ns> rollout pause deploy/api
-   ```
-3. **Run readiness checks** against green (section above). Abort on any
-   failure.
-4. **Point the connection secret at green** and restart consumers so they
-   re-establish connections to the new endpoint.
-   ```
-   kubectl -n <ns> create secret generic db-conn \
-     --from-literal=DATABASE_URL="$GREEN_DATABASE_URL" \
-     --dry-run=client -o yaml | kubectl apply -f -
-   kubectl -n <ns> rollout restart deploy/api
-   ```
-5. **Resume the worker** and confirm it re-acquires the lease and advances the
-   cursor on green.
-   ```
-   kubectl -n <ns> scale deploy/indexer-worker --replicas=<n>
-   ```
-6. **Verify** API health and that the indexer cursor is advancing (metrics in
-   section 6).
+### 4.3 Rollback conditions (active read region → primary)
 
-### Rollback procedure
+Roll back to the primary region when **either**:
 
-Rollback is the same sequence with the endpoints swapped. Trigger rollback if
-any readiness check fails after the switch, if the worker cannot re-acquire the
-lease, or if API error rate rises above threshold.
+1. **Primary recovered and stable.** Primary read health has been within
+   thresholds for at least the configured stability window (default: 10
+   minutes), **or**
+2. **Secondary serving stale data beyond tolerance.** The active secondary's
+   replication lag exceeds the stale-data tolerance (default: > 60s) — reads
+   are more correct from a recovered primary than from a badly lagged
+   secondary.
 
-1. **Pause the worker** (`scale deploy/indexer-worker --replicas=0`).
-2. **Drain the API** (`rollout pause deploy/api`).
-3. **Point the connection secret back at blue** and restart the API.
-   ```
-   kubectl -n <ns> create secret generic db-conn \
-     --from-literal=DATABASE_URL="$BLUE_DATABASE_URL" \
-     --dry-run=client -o yaml | kubectl apply -f -
-   kubectl -n <ns> rollout restart deploy/api
-   ```
-4. **Resume the worker** and confirm the lease is re-acquired and the cursor
-   advances on blue.
+Rollback uses the same DNS/edge switch, so network identity is preserved.
 
-### Behavior during cutover
+### 4.4 Simulated regional loss rehearsal
 
-- **In-flight API requests** complete against the endpoint they started on;
-  draining ensures no request spans the switch. New requests after restart use
-  the new endpoint.
-- **Worker pause/resume.** While paused, no cursor writes occur. On resume the
-  worker re-establishes its connection pool and re-acquires the lease; fencing
-  prevents a stale owner from writing to the wrong endpoint.
-- **Connection re-establishment.** Restarting consumers forces fresh
-  connections; pooled connections to the old endpoint are discarded rather than
-  reused.
+Rehearse quarterly (and before any topology change) using the following
+scripted scenario in a non-production environment:
 
-### Failure and boundary cases
+1. **Baseline.** Confirm primary is active read region; record read error
+   rate, p99 latency, and secondary replication lag.
+2. **Inject loss.** Block read traffic to the primary region (firewall/edge
+   rule) to simulate regional loss. Do **not** stop the primary database.
+3. **Observe promotion.** Expect: primary read health crosses threshold →
+   promotion conditions evaluated → secondary promoted → DNS/edge switch →
+   clients continue hitting the same hostname. Record time-to-promote.
+4. **Verify stale-data visibility.** Confirm responses from the secondary
+   carry the staleness signal (§4.6) and that the reported lag matches the
+   observed replication lag.
+5. **Restore primary.** Remove the block; wait for the stability window.
+6. **Observe rollback.** Expect rollback to primary once stable; confirm
+   network identity unchanged and staleness signal cleared.
 
-- **Target unreachable.** Readiness check 1 fails; cutover aborts, blue keeps
-  serving.
-- **Partial cutover.** If the secret is updated but a consumer fails to
-  restart, that consumer keeps its old connections until restarted; re-run the
-  restart step. The worker stays paused until verified.
-- **Rollback path.** Any post-switch failure follows the rollback procedure
-  above; the worker is paused first so no writes land on the wrong endpoint
-  mid-rollback.
+Record the rehearsal outcome (time-to-promote, time-to-rollback, any
+threshold breaches) in the operations log.
+
+### 4.5 Consistency limitations for writes during failover
+
+- **No cross-region write failover.** Writes continue to target the primary
+  region only. If the primary is truly lost (not just read-degraded), writes
+  fail until the primary recovers; this runbook does not promote a secondary
+  to accept writes.
+- **Read-after-write anomalies.** A client that writes to the primary and
+  immediately reads from a promoted secondary may not see its own write until
+  replication catches up (bounded by the replication lag at promotion time).
+- **Replication lag window.** Reads served by a secondary reflect the primary
+  as of up to the lag bound (default 30s) in the past. Data newer than that
+  window may be missing from secondary reads.
+- **Indexer cursor.** The indexer lease remains on the primary; secondary
+  reads may lag the live cursor by the replication lag.
+
+### 4.6 Surfacing stale data to clients
+
+When reads are served by a non-primary region, responses include a staleness
+signal so clients can decide whether to retry against the primary or tolerate
+the lag:
+
+- A response header (e.g. `X-Data-Staleness-Seconds`) reporting the current
+  replication lag in seconds, and
+- A boolean flag (e.g. `X-Read-From-Secondary: true`) indicating the response
+  came from a secondary region.
+
+When serving from the primary, the staleness header is `0` and the secondary
+flag is absent/false. These are additive headers; existing clients that ignore
+unknown headers are unaffected.
+
+### 4.7 Checks and automated coverage
+
+Focused automated coverage validates the failover decision logic:
+
+- **Promotion:** promotes when primary is degraded, lag is within bound, and
+  secondary is healthy.
+- **Failure — primary unavailable:** promotion proceeds when primary read
+  health is fully unavailable (treated as degraded).
+- **Failure — replication lag exceeded:** promotion is refused when the
+  candidate secondary's lag exceeds the bound.
+- **Boundary — lag exactly at threshold:** lag equal to the bound is treated
+  as within bound (promotes).
+- **Boundary — partial recovery:** rollback is refused while primary health is
+  recovering but has not yet met the stability window.
+- **Rollback — stale secondary:** rollback triggers when the active secondary's
+  lag exceeds the stale-data tolerance.
 
 ---
 
-## 5. Soroban RPC retry/backoff, graceful shutdown, and poll cancellation
+## 5. Soroban RPC retry and backoff
 
-See the sections below for the RPC retry/backoff policy, graceful shutdown, and
-poll cancellation behavior. These are unchanged by the cutover procedure; the
-worker pause/resume above reuses the existing graceful-shutdown path.
-
----
-
-## 6. Indexer metrics
-
-Operators watch the indexer metrics (lease acquisition/renewal, rejected stale
-writes, cursor position, poll latency) to confirm health after a cutover. A
-healthy post-cutover state shows the lease held by exactly one worker and the
-cursor advancing.
+*(unchanged — see existing sections below)*
