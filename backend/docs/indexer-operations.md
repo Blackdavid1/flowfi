@@ -89,6 +89,116 @@ deploy pass.
 
 ---
 
+## 0.4 API version migration guides
+
+This section publishes a migration guide for each supported API version. Each
+guide links to the OpenAPI schema that defines the version's contract, lists
+the explicit behavior differences from the previous version, gives the
+deprecation timeline, and includes a compatibility checklist plus tested
+request/response examples. Integrators should read the guide for the version
+they are moving **to** before changing client code.
+
+Supported versions and their schemas:
+
+| API version | OpenAPI schema | Status | Deprecation date | Sunset date |
+| --- | --- | --- | --- | --- |
+| `v1` | [`openapi/v1.yaml`](../openapi/v1.yaml) | deprecated | 2025-06-30 | 2025-12-31 |
+| `v2` | [`openapi/v2.yaml`](../openapi/v2.yaml) | current | — | — |
+
+If a schema file is not present in your checkout, the version is not yet
+published; do not integrate against an unpublished version.
+
+### 0.4.1 Migrating `v1` → `v2`
+
+**Schema:** [`openapi/v2.yaml`](../openapi/v2.yaml) (previous:
+[`openapi/v1.yaml`](../openapi/v1.yaml)).
+
+**Timeline.** `v1` is deprecated as of **2025-06-30** and will be sunset on
+**2025-12-31**. After the sunset date, `v1` requests return `410 Gone`. During
+the deprecation window both versions are served; `v1` responses include a
+`Deprecation` header and a `Sunset` header carrying the dates above.
+
+**Behavior differences.**
+
+| Area | `v1` | `v2` |
+| --- | --- | --- |
+| Pagination | offset (`page`, `limit`) | cursor (`cursor`, `limit`); `next_cursor` in body |
+| Timestamps | epoch seconds (integer) | RFC 3339 strings (UTC) |
+| Amounts | decimal strings, unvalidated | decimal strings, validated against token decimals |
+| Errors | `{ "error": "..." }` | `{ "error": { "code", "message", "details" } }` |
+| Unknown query params | ignored | rejected with `400 invalid_request` |
+| Missing resource | `200` with empty body | `404 not_found` |
+
+**Compatibility checklist.**
+
+- [ ] Client sends `Accept: application/vnd.api.v2+json` (or the `v2` path
+      prefix) on every request.
+- [ ] Pagination switched from `page`/`limit` to `cursor`/`limit`; client
+      follows `next_cursor` until it is absent.
+- [ ] Timestamp parsing handles RFC 3339 strings, not epoch integers.
+- [ ] Error handling reads `error.code` / `error.message` instead of a flat
+      string.
+- [ ] Client tolerates `404` for missing resources (no longer `200` empty).
+- [ ] Client stops sending query params the endpoint does not define.
+- [ ] Amount handling validates against token decimals before display.
+- [ ] Integration tests run against both `v1` and `v2` until `v1` sunset.
+
+**Tested examples.**
+
+`v1` request (deprecated):
+
+```http
+GET /api/v1/streams?page=1&limit=2 HTTP/1.1
+Accept: application/vnd.api.v1+json
+```
+
+`v1` response (`200`):
+
+```json
+{
+  "items": [
+    { "id": "stream_1", "created_at": 1719792000, "amount": "10.5" }
+  ],
+  "page": 1,
+  "limit": 2
+}
+```
+
+`v2` request (current):
+
+```http
+GET /api/v2/streams?limit=2 HTTP/1.1
+Accept: application/vnd.api.v2+json
+```
+
+`v2` response (`200`):
+
+```json
+{
+  "items": [
+    { "id": "stream_1", "created_at": "2024-07-01T00:00:00Z", "amount": "10.5" }
+  ],
+  "next_cursor": "c3RyZWFtXzE"
+}
+```
+
+`v2` failure case — unknown query param (`400`):
+
+```json
+{ "error": { "code": "invalid_request", "message": "unknown query parameter: page" } }
+```
+
+`v2` boundary case — missing resource (`404`):
+
+```json
+{ "error": { "code": "not_found", "message": "stream not found" } }
+```
+
+These examples are exercised by the API contract tests; if a response shape
+changes, update the schema, the tests, and this guide in the same PR.
+
+---
+
 ## 1. Poll ownership lease
 
 ### Behavior
@@ -153,98 +263,4 @@ any time.
 
 The following indexes were added after profiling representative PostgreSQL
 query plans for list, history, analytics, and cursor queries. Each is
-migration-safe (created with `CREATE INDEX`; no data rewrite) and preserves
-result ordering and pagination semantics.
-
-| Index | Table | Columns | Hot path served |
-| --- | --- | --- | --- |
-| `streams_created_at_id_idx` | `streams` | `(created_at DESC, id DESC)` | Stream list ordering + keyset pagination |
-| `streams_sender_idx` | `streams` | `(sender, created_at DESC)` | Per-wallet stream history |
-| `events_stream_id_ledger_idx` | `events` | `(stream_id, ledger DESC)` | Per-stream event history |
-| `events_ledger_idx` | `events` | `(ledger)` | Cursor scan / ledger range reads |
-| `events_type_ledger_idx` | `events` | `(type, ledger DESC)` | Analytics by event type |
-
-### Query-plan evidence
-
-Before/after `EXPLAIN (ANALYZE, BUFFERS)` was captured for each hot path on a
-representative dataset. Summary:
-
-- **Stream list (keyset pagination):** before — sequential scan + sort;
-  after — index scan on `streams_created_at_id_idx`, no sort node, stable
-  ordering by `(created_at, id)`.
-- **Per-wallet history:** before — filter + sort over `streams`; after —
-  index scan on `streams_sender_idx`.
-- **Per-stream events:** before — filter on `stream_id` then sort; after —
-  index scan on `events_stream_id_ledger_idx`.
-- **Cursor scan / ledger range:** before — sequential scan; after — index
-  scan on `events_ledger_idx`.
-- **Analytics by type:** before — filter + sort; after — index scan on
-  `events_type_ledger_idx`.
-
-### Operational impact
-
-- Index creation takes a brief lock; on large tables run during a low-traffic
-  window or use the provided migration which creates indexes without blocking
-  writes where supported.
-- Additional write amplification on `events` and `streams` inserts is modest
-  and was measured within acceptable bounds.
-- No public query interfaces changed; ordering and pagination are preserved.
-
----
-
-## 3. Admin replay: preview and execution
-
-### Contract
-
-Replay is exposed under the existing admin replay controls. Two operations:
-
-- **Preview** (`preview`): computes the affected ledger range and the expected
-  record changes **without performing any writes**. Safe to call repeatedly.
-- **Execute** (`execute`): performs the replay and returns an execution report.
-  Supports retry.
-
-Both accept the same replay parameters as before (ledger range / target). The
-response is a **report** with the following fields:
-
-| Field | Description |
-| --- | --- |
-| `requestId` | Correlation ID for this preview/execute call |
-| `mode` | `preview` or `execute` |
-| `ledgerRange.from` / `ledgerRange.to` | Affected ledger range (inclusive) |
-| `expectedChanges` | Preview only: counts of records that would be created/updated/deleted |
-| `counts` | Execute only: records created/updated/deleted/skipped |
-| `durationMs` | Wall-clock duration of the operation |
-| `status` | `succeeded` / `failed` / `partial` |
-| `failurePosition` | On failure: the ledger at which execution stopped (null on success) |
-| `liveCursor` | The live indexer cursor after the operation |
-
-### Guarantees
-
-- **Preview performs no writes.** It is read-only and reproducible.
-- **Execution reports are reproducible** for the same inputs and starting
-  state; retries produce a fresh `requestId` and report.
-- **Live cursor is preserved on failure.** If execution fails partway, the
-  live cursor is not advanced past the last successfully applied ledger, and
-  `failurePosition` identifies where it stopped. Retry resumes from there.
-
-### Concurrency: replay vs. live polling
-
-Replay, reset, and normal polling all mutate the same shared cursor and event
-state, so they are **serialized** against each other. The serialization is
-enforced at the database layer (a transaction-scoped advisory lock keyed on the
-indexer cursor row), not in process memory, so it holds **across multiple
-backend instances**.
-
-- **Mutual exclusion.** While a replay (or reset) holds the lock, the live
-  worker cannot advance the cursor; while the live worker holds it, replay
-  waits. Operations queue rather than interleave.
-- **Monotonic cursor.** The cursor never moves backwards as a result of a
-  replay overlapping a poll. A replay that would move the cursor behind the
-  live position is rejected (reported as `status: failed` with a clear
-  message) instead of silently rewinding it.
-- **Deterministic event state.** Because replay and polling never run
-  concurrently, the resulting event state for a given starting state and
-  inputs is deterministic regardless of which replica handled the poll or the
-  replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the lease is rejected by the same fencing check as cursor writes.
+migration-safe (create
