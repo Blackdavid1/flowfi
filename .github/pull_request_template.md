@@ -21,6 +21,17 @@ Closes #
 ## Changes Made
 <!-- Describe the specific changes made in this PR -->
 
+## Contract Reference Tables
+<!-- Complete when this PR adds or changes contract entrypoints, state transitions, authorization, or emitted events -->
+<!-- See the contract reference tables in the contracts documentation for the expected format -->
+
+- [ ] State-transition table added/updated (from state → to state → entrypoint → precondition)
+- [ ] Authorization table added/updated (entrypoint → required role → failure behavior)
+- [ ] Emitted events documented per entrypoint
+- [ ] Terminal states and calls against them documented
+- [ ] Unsupported/invalid transitions explicitly identified
+- [ ] Tables validated against contract tests
+
 ## Testing
 <!-- Describe the tests you ran and how to verify your changes -->
 

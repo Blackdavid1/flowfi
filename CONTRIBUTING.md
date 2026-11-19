@@ -63,6 +63,42 @@ These are expected, safe failures — the deployment should stop rather than pro
 
 Before changing deployment instructions, cross-check them against the repository's current deployment configuration (for example the deploy workflow, testnet E2E configuration, and backend environment example). If the configuration and this guide disagree, update the guide in the same PR that changes the configuration.
 
+## Contract reference tables
+
+Contract entrypoints, their preconditions, authorization roles, emitted events, and terminal behavior are documented as reference tables so reviewers can check them against the contract tests. Keep these tables in sync with the contract source and tests in the same PR that changes contract behavior.
+
+### State transitions
+
+Each row lists a transition, the state it is allowed from, the resulting state, and whether it is supported. Transitions marked **unsupported** must be rejected by the contract and covered by a failing test.
+
+| Transition | From state | To state | Supported |
+| --- | --- | --- | --- |
+| `create` | (none) | `Active` | Yes |
+| `fund` | `Active` | `Active` | Yes |
+| `complete` | `Active` | `Completed` | Yes |
+| `cancel` | `Active` | `Cancelled` | Yes |
+| `complete` | `Completed` | `Completed` | No — terminal state |
+| `cancel` | `Completed` | `Cancelled` | No — terminal state |
+| `fund` | `Cancelled` | `Active` | No — terminal state |
+| `complete` | `Cancelled` | `Completed` | No — terminal state |
+
+### Authorization roles
+
+| Entrypoint | Allowed caller | Preconditions | Emitted event |
+| --- | --- | --- | --- |
+| `create` | Any wallet | Valid parameters | `Created` |
+| `fund` | Funder wallet | State is `Active`; sufficient balance | `Funded` |
+| `complete` | Owner / authorized role | State is `Active` | `Completed` |
+| `cancel` | Owner / authorized role | State is `Active` | `Cancelled` |
+
+Unauthorized callers and calls against terminal states must fail without changing state or emitting events. Do not relax these authorization or state checks to make a change pass.
+
+### Validating the tables
+
+- Cross-check every row against the contract tests; a documented transition without a matching test (or vice versa) is a gap to fix in the same PR.
+- Explicitly list unsupported transitions and the failure they produce rather than omitting them.
+- When contract behavior changes, update these tables and the corresponding tests together.
+
 ## Automated coverage
 
 Changes to deployment selection or verification behavior should include focused automated tests covering:
@@ -70,6 +106,13 @@ Changes to deployment selection or verification behavior should include focused 
 - the happy path for each environment,
 - each safe-failure case above (chain ID mismatch, unknown contract, token/contract mismatch, missing artifact, missing secrets),
 - boundary cases such as an empty network selection or an artifact built for a different environment.
+
+Changes to contract behavior should include focused automated tests covering:
+
+- each supported state transition and its emitted event,
+- unauthorized callers for each restricted entrypoint,
+- invalid and unsupported transitions (including calls against terminal states),
+- boundary cases such as empty or malformed parameters.
 
 ## Submitting changes
 
