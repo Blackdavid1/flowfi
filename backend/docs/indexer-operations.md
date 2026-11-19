@@ -4,9 +4,10 @@ This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
 graceful shutdown and poll cancellation, deployment configuration drift
-detection, and the indexer metrics. It is written for operators and on-call
-engineers. All public interfaces described here are additive; existing
-endpoints and configuration keys keep working unless noted.
+detection, the automated rollback decision evidence, and the indexer metrics.
+It is written for operators and on-call engineers. All public interfaces
+described here are additive; existing endpoints and configuration keys keep
+working unless noted.
 
 ---
 
@@ -167,114 +168,69 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the lease is rejected by the same fencing check that guards cursor writes.
+- **Fencing still applies.** A rep
 
 ---
 
-## 4. Deployment configuration drift detection
+## 4. Automated rollback decision evidence
 
 ### Purpose
 
-Drift detection compares the **running service configuration** against the
-**approved deployment manifest** and reports meaningful differences so that
-operators can catch unapproved changes (manual edits, stale env vars, partial
-rollouts) before they cause incidents. It is read-only and never mutates the
-running configuration.
+A single liveness probe is not sufficient evidence to decide whether a
+deployment should be rolled back. The indexer exposes a **rollback
+recommendation** that aggregates independent health signals into a
+transparent, auditable decision. The recommendation is **advisory only**: it
+never executes a rollback. Rollback execution remains an explicit,
+human-controlled action (see *Decision ownership* below).
 
-### Secret-safe comparison
+### Signals and thresholds
 
-- **Normalization.** Before comparison, both sides are normalized: keys are
-  lower-cased and trimmed, string values are trimmed, numeric/boolean values
-  are coerced to a canonical form, and list ordering is ignored where the
-  manifest declares a set. This avoids false positives from formatting.
-- **Secret masking.** Any key whose name matches the secret pattern
-  (`*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*PRIVATE_KEY*`, `*API_KEY*`, and the
-  manifest's `secretKeys` list) is compared **by presence and hash only**. The
-  raw value is never read into the drift report, logged, or returned. Drift
-  output shows `***` for the value and only reports `present` / `missing` /
-  `changed`.
-- **No secret leakage.** Drift reports, logs, and alerts contain only key
-  names, masked values, and classification — never plaintext secrets.
+Each signal is evaluated independently and reported with its observed value,
+the threshold it was compared against, and a per-signal verdict
+(`ok` / `warn` / `breach` / `unknown`).
 
-### Classification
+| Signal | Source | Warn | Breach | Notes |
+| --- | --- | --- | --- | --- |
+| `health` | Liveness/readiness probe | any non-`ok` readiness | probe failing for > 2 consecutive checks | Liveness alone never triggers a breach |
+| `indexerLag` | `head_ledger - cursor` | > 50 ledgers | > 200 ledgers | Lag is measured in ledgers, not wall-clock |
+| `migration` | Applied vs. expected migration set | pending non-destructive migration | failed or partially-applied migration | Unknown when the expected set cannot be read |
+| `errorRate` | Rolling error ratio over the window | > 2% | > 5% | Window is the configured evaluation interval |
 
-Each difference is classified so alerts can distinguish expected from
-unexpected changes:
+Thresholds are configuration-driven and documented alongside the code that
+evaluates them. Changing a threshold is a reviewed change; the recommendation
+reports the thresholds it used so a decision can be reconstructed later.
 
-| Class | Meaning | Alert |
-| --- | --- | --- |
-| `expected` | Change is listed in the manifest's `allowedDrift` (e.g. replica count, log level) | Informational only |
-| `unexpected` | Value differs and is not allow-listed | **Alert** |
-| `missing` | Key required by the manifest is absent at runtime | **Alert** |
-| `extra` | Key present at runtime but not in the manifest | **Alert** (unless allow-listed) |
+### Recommendation
 
-A run with any `unexpected`, `missing`, or non-allow-listed `extra` difference
-is reported as `drift: true` and is alertable.
+- **`rollback`** — at least one signal is in `breach`, or two or more signals
+  are in `warn`.
+- **`hold`** — no breaches and fewer than two warnings; the deployment may
+  continue but should be watched.
+- **`insufficient_evidence`** — one or more required signals are `unknown`
+  (e.g., a metric could not be collected). A missing metric is **never**
+  treated as healthy or as a breach; it downgrades the recommendation to
+  `insufficient_evidence` so the decision is not made on partial data.
 
-### Remediation guidance
+Each recommendation includes the per-signal evidence that produced it, so an
+operator can see exactly which signal drove the outcome.
 
-Every alertable difference includes remediation guidance, e.g.:
+### Decision ownership
 
-- `unexpected` — "Revert `<KEY>` to the manifest value or update the approved
-  manifest via the normal change process."
-- `missing` — "Set `<KEY>` from the approved manifest and redeploy."
-- `extra` — "Remove `<KEY>` or add it to the approved manifest."
+- The system **recommends**; it does not act. No automatic rollback is
+  triggered by any signal or by the aggregate recommendation.
+- The on-call engineer owns the rollback decision and records the
+  recommendation and evidence in the incident timeline when acting on it.
+- Rollback execution follows the documented rollout/rollback procedures in
+  this guide and remains an explicit operator action.
 
 ### Failure and boundary cases
 
-- **Missing manifest** — reported as a configuration error; no drift is
-  computed and no secrets are emitted.
-- **Empty configuration** — every required key is reported `missing`.
-- **Secret value changed** — reported as `changed` with masked value; the
-  plaintext never appears in output.
-- **Allow-listed change** — reported `expected` and does not set `drift: true`.
-
-### Configuration
-
-| Key | Meaning | Notes |
-| --- | --- | --- |
-| `DRIFT_MANIFEST_PATH` | Path to the approved deployment manifest | Required to run drift detection |
-| `DRIFT_ALLOWED_KEYS` | Comma-separated keys treated as expected drift | Optional; merged with manifest `allowedDrift` |
+- **False positive:** a transient readiness blip with healthy lag, migrations,
+  and error rate yields at most a `warn` on `health` and a `hold`
+  recommendation — not a rollback.
+- **Missing metric:** if any required signal cannot be collected, the
+  recommendation is `insufficient_evidence` rather than `hold` or `rollback`.
+- **Boundary:** a signal exactly at its threshold is treated as `warn`, not
+  `breach`; breach requires strictly exceeding the threshold.
 
 ---
-
-## 5. Soroban RPC retry and backoff
-
-### Behavior
-
-Soroban RPC calls are retried with exponential backoff and jitter on transient
-failures (timeouts, 5xx, rate limits). Non-retryable errors (4xx validation)
-fail fast. Retries are bounded by a max attempt count and a total deadline so a
-single call cannot block the poll loop indefinitely.
-
-### Configuration
-
-| Key | Meaning | Notes |
-| --- | --- | --- |
-| `SOROBAN_RPC_MAX_ATTEMPTS` | Max attempts per call | Includes the first attempt |
-| `SOROBAN_RPC_BASE_DELAY_MS` | Base backoff delay | Grows exponentially with jitter |
-| `SOROBAN_RPC_MAX_DELAY_MS` | Backoff cap | Upper bound per wait |
-| `SOROBAN_RPC_TIMEOUT_MS` | Per-call timeout | Applies to each attempt |
-
----
-
-## 6. Graceful shutdown and poll cancellation
-
-On `SIGTERM`/`SIGINT` the indexer stops accepting new work, cancels the
-in-flight poll via an abort signal, releases the lease, and exits within the
-shutdown grace period. A cancelled poll does not advance the cursor past the
-last fully applied ledger, so the next owner resumes cleanly.
-
----
-
-## 7. Metrics
-
-| Metric | Meaning |
-| --- | --- |
-| `indexer_lease_acquired_total` | Successful lease acquisitions |
-| `indexer_lease_renewed_total` | Successful renewals |
-| `indexer_lease_fenced_writes_total` | Cursor writes rejected by fencing |
-| `indexer_poll_duration_ms` | Poll loop duration |
-| `indexer_replay_total` | Replay executions by status |
-| `indexer_drift_detected_total` | Drift runs reporting `drift: true` |
