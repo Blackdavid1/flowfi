@@ -3,10 +3,11 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, the indexer metrics, and the
-repeatable dependency-outage game days. It is written for operators and
-on-call engineers. All public interfaces described here are additive;
-existing endpoints and configuration keys keep working unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, the
+repeatable dependency-outage game days, and the long-running memory/queue
+soak test. It is written for operators and on-call engineers. All public
+interfaces described here are additive; existing endpoints and configuration
+keys keep working unless noted.
 
 ---
 
@@ -167,70 +168,79 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the lease is rejected by the same fencing check that guards cursor writes.
+- **Fencing still applies.** A r
 
 ---
 
-## 4. Dependency outage game days
+## 4. Long-running memory and queue stability (soak test)
 
-Game days exercise operator response to outages of the indexer's external
-dependencies: **database**, **cache**, **Soroban RPC**, and **webhook
-provider**. They are repeatable, isolated, and never touch production.
+The indexer ships a repeatable soak test that drives event polling, SSE
+fanout, webhook dispatch, and replay under sustained representative traffic
+and asserts that memory and queue depths stay bounded. It guards against
+slow resource growth (leaks, unbounded buffers, queue backlogs) that short
+unit tests miss.
 
-### Isolation requirements
+### What it exercises
 
-- Run against a dedicated, disposable environment (ephemeral database, cache,
-  RPC endpoint, and webhook sink). Never point a game day at production data
-  or production provider credentials.
-- Use a dedicated indexer replica with its own lease/cursor so a game day
-  cannot advance the production cursor.
-- Fault injection is applied at the dependency boundary (network block, proxy
-  error, or provider stub), not by editing application code.
-- **Production execution stays behind explicit approval.** Game days never
-  auto-run against production; any production-affecting step requires a
-  recorded human approval before it starts.
+- **Event polling** — a continuous stream of synthetic ledgers/events at a
+  representative rate for the full soak window.
+- **SSE fanout** — a fixed set of subscribers, including at least one **slow
+  consumer** that reads below the production rate, to exercise backpressure.
+- **Webhook dispatch** — deliveries to a mix of fast and slow/failing
+  endpoints to exercise retry and queue bounds.
+- **Replay** — a large backlog replay (including a boundary-sized range) run
+  alongside live traffic to exercise the replay queue and cursor
+  serialization.
 
-### Scenarios
+### Published thresholds
 
-For each scenario, inject the fault, observe detection, then remove the fault
-and observe recovery. Record the outcome in the table below.
+The soak test fails if any of the following bounds are exceeded over the
+window. Thresholds are intentionally generous to avoid flakiness on shared CI
+runners while still catching unbounded growth.
 
-| Scenario | Injection | Expected detection | Expected recovery |
-| --- | --- | --- | --- |
-| Database outage | Block DB connections / stop DB | Lease renewal fails; worker stops advancing cursor; errors logged and counted | Reconnect; lease re-acquired; cursor resumes from last committed ledger |
-| Cache outage | Stop cache / return errors | Cache misses fall through to source; elevated latency and cache-error metrics | Cache restored; hit rate returns to baseline |
-| Soroban RPC outage | Return 5xx / timeouts from RPC | Retry/backoff engages; poll pauses; RPC error metrics rise | RPC restored; backoff clears; polling resumes without skipping ledgers |
-| Webhook provider outage | Return 5xx / timeouts from webhook sink | Delivery retries with backoff; failures counted; no data loss | Provider restored; queued deliveries drain; backlog returns to zero |
+| Metric | Bound | Rationale |
+| --- | --- | --- |
+| Heap growth (post-warmup) | ≤ 25% of baseline, and ≤ 64 MiB absolute | Catches leaks without penalizing GC jitter |
+| Polling backlog depth | ≤ 1 batch (never grows across iterations) | Polling must drain each batch |
+| SSE subscriber buffer depth | ≤ configured per-subscriber cap | Slow consumers are dropped/backpressured, not buffered unboundedly |
+| Webhook dispatch queue depth | ≤ configured max queue size | Dispatch queue must stay bounded under slow/failing endpoints |
+| Replay queue depth | ≤ 1 in-flight replay | Replay is serialized against polling |
+| Dropped/evicted SSE subscribers | counted, not unbounded | Slow consumers are evicted rather than accumulating |
 
-### Fail-closed requirement (no unsafe mutation fallback)
+### Failure and boundary cases covered
 
-During any outage the indexer must **fail closed**: it pauses or retries and
-never falls back to an unsafe mutation path (e.g., advancing the cursor
-without applying events, writing partial state, or bypassing fencing).
-Operators must confirm for every scenario that:
+- **Queue saturation** — traffic is driven above the drain rate to confirm
+  queues cap out and shed load instead of growing without bound.
+- **Slow consumers** — a subscriber that reads slowly must be backpressured
+  or evicted; its buffer must not grow past the cap.
+- **Large backlog replay** — replaying a boundary-sized ledger range must
+  complete with bounded memory and must not advance the live cursor past the
+  last applied ledger on failure.
 
-- The cursor did not advance past unapplied ledgers.
-- No partial or speculative writes were committed.
-- Fencing and lease checks were still enforced.
-- No secret or credential was logged or exposed during the fault.
+### Reproduction
 
-### Recording outcomes
+Run the soak test from the backend package. It is opt-in (not part of the
+fast unit suite) so it does not slow normal CI:
 
-Record each run in a structured entry so game days are repeatable and
-comparable across runs:
+```bash
+cd backend
+# Default soak window (short, CI-friendly)
+npm run test:soak
 
+# Longer local soak window (e.g. 5 minutes)
+SOAK_DURATION_MS=300000 npm run test:soak
 ```
-scenario: <database|cache|soroban-rpc|webhook>
-runId: <unique id>
-startedAt / endedAt: <ISO-8601 timestamps>
-detection: <signal observed + time to detect>
-recovery: <signal observed + time to recover>
-failClosed: <true|false>  # must be true
-unsafeFallbackObserved: <true|false>  # must be false
-notes: <free text>
-```
 
-A game day passes only when every scenario records `failClosed: true` and
-`unsafeFallbackObserved: false`. Any failure is treated as a defect and
-blocks the related release until fixed.
+Environment knobs:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SOAK_DURATION_MS` | Soak window length | Short CI-friendly default |
+| `SOAK_EVENT_RATE` | Synthetic events per second | Representative production rate |
+| `SOAK_SSE_SUBSCRIBERS` | Number of SSE subscribers | Small fixed set |
+| `SOAK_WEBHOOK_ENDPOINTS` | Number of webhook endpoints | Small fixed set |
+
+If a threshold is exceeded, the test reports the offending metric, its
+observed value, and the bound so the regression can be triaged. Thresholds
+and reproduction steps above are the published contract for this test; update
+them here if the bounds change.
