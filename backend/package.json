@@ -25,6 +25,8 @@
     "prisma:seed": "prisma db seed",
     "prisma:studio": "prisma studio",
     "codegen:openapi": "tsx scripts/export-openapi.mts",
+    "codegen:bindings": "tsx scripts/generate-contract-bindings.ts",
+    "check:bindings-drift": "tsx scripts/generate-contract-bindings.ts --check",
     "check:api-compat": "tsx scripts/check-api-compatibility.ts",
     "check:schema-compat": "tsx scripts/check-schema-compat.ts"
   },

@@ -39,6 +39,7 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Project Overview](#project-overview)
 - [Local Development Setup](#local-development-setup)
 - [Operator CLI](#operator-cli)
+- [SDK Typed Bindings](#sdk-typed-bindings)
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
@@ -335,6 +336,57 @@ npm run test -- cli
 
 ---
 
+## SDK Typed Bindings
+
+The SDK's typed client bindings (contract methods, events, and error types) are
+generated from a **pinned** contract interface artifact rather than hand-written,
+so the TypeScript surface stays aligned with the deployed contract.
+
+### Pinned inputs
+
+Both the source artifact and the generator toolchain are pinned and committed:
+
+- **Contract interface artifact** — the versioned ABI/interface file under
+  `sdk/contract-interface/` (e.g. `stream_contract.interface.json`). Its version
+  and content hash are recorded in `sdk/contract-interface/PINNED.json`.
+- **Generator toolchain** — the binding generator version is pinned in
+  `sdk/package.json` (and the lockfile). Do not bump it without regenerating and
+  committing the output in the same change.
+
+### Regenerating bindings
+
+After changing the contract interface (or intentionally bumping the generator),
+regenerate the committed bindings from the repository root:
+
+```bash
+# 1. Update the pinned artifact + hash (only when the interface changed)
+npm run sdk:pin-interface
+
+# 2. Regenerate typed bindings from the pinned artifact
+npm run sdk:generate-bindings
+
+# 3. Commit the pinned artifact, PINNED.json, and generated bindings together
+git add sdk/contract-interface sdk/src/generated
+```
+
+Generated files live under `sdk/src/generated/` and must never be edited by
+hand — changes are overwritten on the next regeneration.
+
+### Drift check in CI
+
+CI runs a drift check that regenerates bindings from the pinned artifact and
+fails if the committed output differs. Run it locally before pushing:
+
+```bash
+npm run sdk:check-bindings
+```
+
+If this fails, run the regeneration steps above and commit the result. A drift
+failure means the committed bindings no longer match the pinned interface or the
+pinned generator version.
+
+---
+
 ## CI/CD Workflows
 
 This repository uses GitHub Actions for continuous integration. Workflows are located in `.github/workflows/`.
@@ -346,64 +398,89 @@ This repository uses GitHub Actions for continuous integration. Workflows are lo
   - Performs:
     - Dependency vulnerability scanning (`npm audit`)
     - CodeQL analysis for JavaScript/TypeScript
-  - View workflow: [Security Checks](.github/workflows/security.yml)
+    - Secret scanning
+    - License compliance checks
 
 - **CI** (`.github/workflows/ci.yml`)
-  - Runs on: push to `main`/`develop` and pull requests
+  - Runs on: pull requests and pushes to `main`/`develop`
   - Performs:
-    - Frontend: lint and build
-    - Backend: prisma generation, build, and tests
-    - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
-    - Soroban Contracts: build (wasm) and tests
-  - View workflow: [CI](.github/workflows/ci.yml)
+    - Backend build and tests
+    - Frontend lint and build
+    - Contract build and tests
+    - SDK binding drift check (`npm run sdk:check-bindings`)
 
-### Running CI Checks Locally
+### Running Checks Locally
 
-Before pushing, ensure your changes pass all the same checks that run in GitHub Actions.
+Before opening a PR, run the relevant checks locally:
 
-#### 1. Frontend Checks
 ```bash
-cd frontend
-npm run lint    # Runs ESLint
-npm run build   # Verifies the build
-```
+# Backend
+cd backend && npm run build && npm run test
 
-#### 2. Backend Checks
-```bash
-cd backend
-npm run prisma:generate  # Ensure Prisma client is up to date
-npm run build           # Verifies TypeScript compilation
-npm run test            # Runs backend vitest suite
-```
-*Note: Backend tests require a running PostgreSQL instance and `DATABASE_URL` environment variable.*
+# Frontend
+cd frontend && npm run lint && npm run build
 
-#### 3. Smart Contract Checks
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release  # Verifies contract build
-cargo test                                            # Runs contract tests
-```
+# Contracts
+cd contracts && cargo test
 
-#### 4. Security Verification
-```bash
-# From the repository root
-npm run verify-security
+# SDK bindings drift
+npm run sdk:check-bindings
 ```
-
-#### 5. Migration Replay Validation
-```bash
-cd backend
-npm run test:migrations   # replays migrations from the previous supported schema
-```
-*Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
-The same check runs in CI as the `migration-replay` job.*
 
 ---
 
-## Database Migrations & Rollout
+## Branching Strategy
 
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every mi
+- `main` — production-ready code
+- `develop` — integration branch
+- `feature/*` — new features
+- `fix/*` — bug fixes
+- `docs/*` — documentation updates
 
-/* … truncated 8348 chars — edit only what you need near the top … */
+Create branches from `develop` and open PRs against `develop`.
+
+---
+
+## Commit Guidelines & Hooks
+
+We follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <description>
+```
+
+Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
+
+### Pre-commit Hooks
+
+This repository uses Husky and lint-staged. On commit, staged files are
+formatted and linted automatically. Do not bypass hooks with `--no-verify`
+unless you have a documented reason.
+
+---
+
+## Pull Request Process
+
+1. Fork the repository and create a branch from `develop`.
+2. Make your changes and add tests where relevant.
+3. Ensure all local checks pass (see [Running Checks Locally](#running-checks-locally)).
+4. Open a PR against `develop` with a clear description and linked issue.
+5. Address review feedback and keep the branch up to date.
+
+PRs that change the contract interface must include the regenerated SDK
+bindings and the updated pinned artifact in the same PR.
+
+---
+
+## Security
+
+- Never commit secrets, private keys, or credentials.
+- Report vulnerabilities privately per [`SECURITY.md`](SECURITY.md).
+- Do not weaken wallet authorization, chain/network validation, financial
+  accounting invariants, or secret-handling requirements to make a change pass.
+
+---
+
+## Code of Conduct
+
+By participating, you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
