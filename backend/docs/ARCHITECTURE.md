@@ -166,26 +166,70 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Payroll Provider Adapter Contract
 
-For a quick reference of the models involved in indexing:
+Payroll integrations (e.g. an external payroll provider) map **approved** payroll
+batches to FlowFi payment instructions. The adapter is a pure translation layer:
+it validates the batch, produces unsigned payment instructions, and reports a
+per-employee result. It **never signs** — final signing stays with the authorized
+wallet (see the Keeper-Key Authorization Model above).
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+### Interface
 
----
+```ts
+export interface PayrollProviderAdapter {
+  readonly providerId: string;
+  /** Convert an approved batch into unsigned FlowFi payment instructions. */
+  buildInstructions(
+    batch: ApprovedPayrollBatch,
+    options: BuildInstructionsOptions,
+  ): Promise<PayrollInstructionResult>;
+}
+```
 
-## Related Documentation
+`buildInstructions` returns `PayrollInstructionResult` containing the produced
+`instructions` (unsigned) and a `results` array with one entry per employee.
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+### Idempotency
+
+- Every call requires an `idempotencyKey` in `BuildInstructionsOptions`.
+- Instructions are deduped on `(providerId, idempotencyKey, batchId, employeeId)`.
+  Replaying the same key returns the previously produced instructions instead of
+  creating duplicates.
+- A batch may only be processed once it is in the `approved` state; re-submitting
+  an already-processed batch with a new key is rejected as a validation error.
+
+### Validation Rules
+
+Before any instruction is produced the adapter validates:
+
+- **Batch:** present, `status === 'approved'`, non-empty employee list, unique
+  `employeeId` per batch, and a supported `network`/`chain` (must match the
+  configured FlowFi network).
+- **Employee:** valid Stellar public key (`G...`), positive `amount` with at most
+  7 decimal places (Stellar precision), and a supported asset.
+- **Amounts:** each amount must be > 0 and the batch total must not exceed the
+  configured per-batch limit.
+
+Validation failures are reported per employee in `results` (with a `reason`);
+batch-level failures reject the whole call with a typed error.
+
+### Per-Employee Result Mapping
+
+Each employee in the batch maps to exactly one result entry:
+
+| Status | Meaning |
+|--------|---------|
+| `success` | Instruction produced for this employee. |
+| `failed` | Employee failed validation; `reason` explains why. |
+| `skipped` | Employee intentionally not paid (e.g. zero amount, opted out); `reason` set. |
+
+### Security Boundary
+
+> **The payroll adapter must never sign or submit transactions.** It only emits
+> unsigned payment instructions. Signing and submission remain with the
+> authorized wallet, preserving the non-custodial security model. The adapter
+> must not read `KEEPER_SECRET_KEY` or any signing secret.
