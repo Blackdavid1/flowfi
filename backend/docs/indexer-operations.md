@@ -10,6 +10,85 @@ unless noted.
 
 ---
 
+## 0. Multi-network deployment decision guide
+
+This section explains how operators select and verify the **network, contract,
+token, endpoint, and release artifact** combination for each environment. It is
+the first thing to read before deploying or promoting a release. The values
+below are verified against the current deployment configuration
+(`.github/workflows/deploy-contracts.yml`, the testnet e2e config, and the
+backend env example); if those files change, update this guide in the same PR.
+
+### 0.1 Environments and their fixed combinations
+
+Each environment pins a single, consistent combination. Never mix values from
+different rows.
+
+| Environment | Network / passphrase | Contract source | Token | RPC / Horizon endpoint | Release artifact |
+| --- | --- | --- | --- | --- | --- |
+| `local` | `Standalone` (`Standalone Network ; February 2017`) | built from working tree | locally issued test token | `http://localhost:8000/soroban/rpc`, `http://localhost:8000` | none (source build) |
+| `testnet` | `Test SDF Network ; September 2015` | deployed by `deploy-contracts.yml` | testnet token from deploy output | `https://soroban-testnet.stellar.org`, `https://horizon-testnet.stellar.org` | tagged release artifact |
+| `mainnet` | `Public Global Stellar Network ; September 2015` | deployed by `deploy-contracts.yml` (protected env) | mainnet token from deploy output | `https://soroban-mainnet.stellar.org`, `https://horizon.stellar.org` | tagged release artifact |
+
+Rules that follow from the table:
+
+- **Network passphrase is authoritative.** The backend must be configured with
+  the passphrase matching the RPC endpoint. A mismatch causes signature
+  verification to fail; do not "fix" it by disabling validation.
+- **Contract and token IDs are per-network.** A contract ID from testnet is
+  meaningless on mainnet. Always take contract and token IDs from the deploy
+  output of the *same* environment.
+- **Endpoints are per-network.** RPC and Horizon must both point at the same
+  network. Mixing a testnet RPC with a mainnet Horizon URL is a misconfiguration.
+- **Release artifacts are immutable.** Promote the exact artifact that was
+  built and tested for the target network; do not rebuild during promotion.
+
+### 0.2 Preflight checklist
+
+Run through this checklist before every deploy or promotion. Each item maps to
+an automated check where one exists.
+
+1. **Network passphrase** matches the target environment (see table).
+2. **RPC endpoint** host matches the network (testnet vs mainnet host).
+3. **Horizon endpoint** host matches the same network as the RPC endpoint.
+4. **Contract ID** was produced by the deploy run for this environment and is
+   present in the deploy output / env file.
+5. **Token contract ID** comes from the same deploy output as the contract ID.
+6. **Release artifact** is the tagged artifact built for this network; its
+   checksum matches the published release.
+7. **Secrets** (deployer key, admin key) are provided by the environment's
+   secret store — never committed and never copied between environments.
+8. **Backend env** has no leftover values from another environment (grep the
+   env file for the other network's hostnames and passphrases).
+
+### 0.3 Safe failure examples
+
+These are the expected, safe outcomes when a combination is wrong. In every
+case the system must **fail closed** — refuse to start or refuse the operation
+— rather than silently proceeding.
+
+- **Passphrase / endpoint mismatch.** Backend configured with the testnet
+  passphrase but a mainnet RPC URL: startup validation rejects the config and
+  the process exits non-zero. It does not fall back to a default network.
+- **Cross-network contract ID.** A testnet contract ID supplied on mainnet:
+  contract calls fail with a not-found / invalid-contract error; the indexer
+  does not advance the cursor past the failed ledger.
+- **Token from the wrong network.** A token ID that does not exist on the
+  configured network: token reads fail explicitly; balances are not reported
+  as zero.
+- **Stale release artifact.** An artifact whose checksum does not match the
+  published release for the target network: promotion is blocked before
+  deploy.
+- **Leaked cross-environment secret.** A deployer key from another environment:
+  the deploy transaction is rejected by the network (wrong account / wrong
+  network); the deploy job fails and does not retry with a different key.
+
+If any of these occur, stop, correct the configuration, and re-run the
+preflight checklist. Do not weaken network or chain validation to make a
+deploy pass.
+
+---
+
 ## 1. Poll ownership lease
 
 ### Behavior
@@ -168,36 +247,4 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
-
----
-
-## 4. Metrics
-
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
-
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+  the lease is rejected by the same fencing check as cursor writes.
