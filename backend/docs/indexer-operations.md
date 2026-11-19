@@ -3,10 +3,10 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, deployment configuration drift
+detection, and the indexer metrics. It is written for operators and on-call
+engineers. All public interfaces described here are additive; existing
+endpoints and configuration keys keep working unless noted.
 
 ---
 
@@ -168,36 +168,113 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Metrics
+## 4. Deployment configuration drift detection
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+### Purpose
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+Drift detection compares the **running service configuration** against the
+**approved deployment manifest** and reports meaningful differences so that
+operators can catch unapproved changes (manual edits, stale env vars, partial
+rollouts) before they cause incidents. It is read-only and never mutates the
+running configuration.
+
+### Secret-safe comparison
+
+- **Normalization.** Before comparison, both sides are normalized: keys are
+  lower-cased and trimmed, string values are trimmed, numeric/boolean values
+  are coerced to a canonical form, and list ordering is ignored where the
+  manifest declares a set. This avoids false positives from formatting.
+- **Secret masking.** Any key whose name matches the secret pattern
+  (`*SECRET*`, `*TOKEN*`, `*PASSWORD*`, `*PRIVATE_KEY*`, `*API_KEY*`, and the
+  manifest's `secretKeys` list) is compared **by presence and hash only**. The
+  raw value is never read into the drift report, logged, or returned. Drift
+  output shows `***` for the value and only reports `present` / `missing` /
+  `changed`.
+- **No secret leakage.** Drift reports, logs, and alerts contain only key
+  names, masked values, and classification — never plaintext secrets.
+
+### Classification
+
+Each difference is classified so alerts can distinguish expected from
+unexpected changes:
+
+| Class | Meaning | Alert |
+| --- | --- | --- |
+| `expected` | Change is listed in the manifest's `allowedDrift` (e.g. replica count, log level) | Informational only |
+| `unexpected` | Value differs and is not allow-listed | **Alert** |
+| `missing` | Key required by the manifest is absent at runtime | **Alert** |
+| `extra` | Key present at runtime but not in the manifest | **Alert** (unless allow-listed) |
+
+A run with any `unexpected`, `missing`, or non-allow-listed `extra` difference
+is reported as `drift: true` and is alertable.
+
+### Remediation guidance
+
+Every alertable difference includes remediation guidance, e.g.:
+
+- `unexpected` — "Revert `<KEY>` to the manifest value or update the approved
+  manifest via the normal change process."
+- `missing` — "Set `<KEY>` from the approved manifest and redeploy."
+- `extra` — "Remove `<KEY>` or add it to the approved manifest."
+
+### Failure and boundary cases
+
+- **Missing manifest** — reported as a configuration error; no drift is
+  computed and no secrets are emitted.
+- **Empty configuration** — every required key is reported `missing`.
+- **Secret value changed** — reported as `changed` with masked value; the
+  plaintext never appears in output.
+- **Allow-listed change** — reported `expected` and does not set `drift: true`.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `DRIFT_MANIFEST_PATH` | Path to the approved deployment manifest | Required to run drift detection |
+| `DRIFT_ALLOWED_KEYS` | Comma-separated keys treated as expected drift | Optional; merged with manifest `allowedDrift` |
+
+---
+
+## 5. Soroban RPC retry and backoff
+
+### Behavior
+
+Soroban RPC calls are retried with exponential backoff and jitter on transient
+failures (timeouts, 5xx, rate limits). Non-retryable errors (4xx validation)
+fail fast. Retries are bounded by a max attempt count and a total deadline so a
+single call cannot block the poll loop indefinitely.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `SOROBAN_RPC_MAX_ATTEMPTS` | Max attempts per call | Includes the first attempt |
+| `SOROBAN_RPC_BASE_DELAY_MS` | Base backoff delay | Grows exponentially with jitter |
+| `SOROBAN_RPC_MAX_DELAY_MS` | Backoff cap | Upper bound per wait |
+| `SOROBAN_RPC_TIMEOUT_MS` | Per-call timeout | Applies to each attempt |
+
+---
+
+## 6. Graceful shutdown and poll cancellation
+
+On `SIGTERM`/`SIGINT` the indexer stops accepting new work, cancels the
+in-flight poll via an abort signal, releases the lease, and exits within the
+shutdown grace period. A cancelled poll does not advance the cursor past the
+last fully applied ledger, so the next owner resumes cleanly.
+
+---
+
+## 7. Metrics
+
+| Metric | Meaning |
+| --- | --- |
+| `indexer_lease_acquired_total` | Successful lease acquisitions |
+| `indexer_lease_renewed_total` | Successful renewals |
+| `indexer_lease_fenced_writes_total` | Cursor writes rejected by fencing |
+| `indexer_poll_duration_ms` | Poll loop duration |
+| `indexer_replay_total` | Replay executions by status |
+| `indexer_drift_detected_total` | Drift runs reporting `drift: true` |
