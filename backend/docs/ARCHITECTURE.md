@@ -166,26 +166,65 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Accounting Export Adapters
 
-For a quick reference of the models involved in indexing:
+FlowFi exposes accounting export adapters that map `Stream` and `StreamEvent`
+records to a documented accounting interchange format (a JSON journal of
+balanced double-entry lines). The adapters live in
+`src/services/accounting-export/` and are consumed by the export endpoint.
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+### Stable Identifiers
 
----
+Every exported line carries stable identifiers so downstream ledgers can
+deduplicate and reconcile without losing provenance:
 
-## Related Documentation
+| Field | Source | Notes |
+|-------|--------|-------|
+| `streamId` | `Stream.id` | Stable across the stream lifecycle. |
+| `eventId` | `StreamEvent.id` | Stable per event row. |
+| `transactionHash` | `StreamEvent.transactionHash` | On-chain provenance. |
+| `ledger` | `StreamEvent.ledger` | On-chain provenance. |
+| `entryId` | `<transactionHash>:<eventType>:<lineIndex>` | Deterministic, idempotent line key. |
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+`entryId` is derived deterministically from the event so re-running an export
+produces byte-identical output for the same input history.
+
+### Rounding
+
+- All amounts are exported as **integer stroops** (1 XLM = 10,000,000 stroops).
+- No floating-point arithmetic is used; amounts are read from the DB as
+  integers and never divided during export.
+- If a downstream format requires decimal units, the adapter emits the integer
+  stroop value plus a `decimals: 7` field so consumers round explicitly.
+
+### Fees
+
+- Protocol fees (`fee_collected` events) are exported as a separate debit line
+  against the protocol fee account, never netted into stream principal.
+- Stream principal, withdrawn amounts, and fees are always distinct lines so
+  the journal remains balanced and auditable.
+
+### Timezone
+
+- All timestamps are normalized to **UTC** and exported as ISO-8601 strings
+  with a `Z` suffix (`createdAt.toISOString()`).
+- No local-time conversion is performed; the export is timezone-independent.
+
+### Reversal Entries
+
+- Cancelled or reversed streams emit reversal lines that negate the original
+  posting (same `entryId` prefix, `reversal: true`, negated amount).
+- Reversals reference the original `transactionHash` so provenance is preserved
+  and the pair can be reconciled.
+
+### Golden-File Tests
+
+Representative lifecycle histories (create → top-up → withdraw → complete, and
+create → cancel) are covered by golden-file tests under
+`src/services/accounting-export/__tests__/`. Each fixture asserts the full
+exported journal, including identifiers, rounding, fees, timezone, and reversal
+entries, plus failure cases (missing transaction hash, unknown event type) and
+boundary cases (zero-amount events, maximum stroop values).
