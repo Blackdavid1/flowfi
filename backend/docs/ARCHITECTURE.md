@@ -169,62 +169,68 @@ The keeper key is a server-side secret and is never exposed to the frontend.
 
 ---
 
-## Accounting Export Adapters
+## Server-Side Signing Boundary & Signer Policy
 
-FlowFi exposes accounting export adapters that map `Stream` and `StreamEvent`
-records to a documented accounting interchange format (a JSON journal of
-balanced double-entry lines). The adapters live in
-`src/services/accounting-export/` and are consumed by the export endpoint.
+Custodial signing is isolated behind a server-only boundary so that signing
+logic and key material never enter browser bundles. Applications that need
+custodial signing supply a **signer policy**; the default is non-custodial and
+denies all custodial signing.
 
-### Stable Identifiers
+### Boundary Rules
 
-Every exported line carries stable identifiers so downstream ledgers can
-deduplicate and reconcile without losing provenance:
+1. **Server-only module.** The signing boundary lives in
+   `src/services/signing/` and is imported only from server entry points
+   (controllers, workers). It must never be imported by frontend code or any
+   module that is bundled for the browser.
+2. **No client key handling.** The frontend never receives, stores, or
+   transmits `KEEPER_SECRET_KEY` or any derived keypair. Client code only sends
+   the stream ID and amount; the server performs signing.
+3. **Explicit opt-in.** Custodial signing is disabled unless a signer policy
+   explicitly authorizes the action. The default policy denies every custodial
+   action (non-custodial default).
 
-| Field | Source | Notes |
-|-------|--------|-------|
-| `streamId` | `Stream.id` | Stable across the stream lifecycle. |
-| `eventId` | `StreamEvent.id` | Stable per event row. |
-| `transactionHash` | `StreamEvent.transactionHash` | On-chain provenance. |
-| `ledger` | `StreamEvent.ledger` | On-chain provenance. |
-| `entryId` | `<transactionHash>:<eventType>:<lineIndex>` | Deterministic, idempotent line key. |
+### Signer Policy Interface
 
-`entryId` is derived deterministically from the event so re-running an export
-produces byte-identical output for the same input history.
+A signer policy decides whether a given signing action is allowed. It receives
+the action name and a redacted context, and returns an allow/deny decision.
 
-### Rounding
+```ts
+export interface SignerPolicy {
+  /** Return true to authorize custodial signing for this action. */
+  authorize(action: SigningAction, context: SigningContext): Promise<boolean> | boolean;
+}
+```
 
-- All amounts are exported as **integer stroops** (1 XLM = 10,000,000 stroops).
-- No floating-point arithmetic is used; amounts are read from the DB as
-  integers and never divided during export.
-- If a downstream format requires decimal units, the adapter emits the integer
-  stroop value plus a `decimals: 7` field so consumers round explicitly.
+- `SigningAction` enumerates the custodial actions (currently `top_up`).
+- `SigningContext` carries non-secret metadata (stream ID, amount, requester).
+- The default policy (`denyAllSignerPolicy`) returns `false` for every action,
+  preserving the non-custodial security model unless an application opts in.
 
-### Fees
+### Audit Records & Secret Redaction
 
-- Protocol fees (`fee_collected` events) are exported as a separate debit line
-  against the protocol fee account, never netted into stream principal.
-- Stream principal, withdrawn amounts, and fees are always distinct lines so
-  the journal remains balanced and auditable.
+Every signing decision — allowed or denied — emits an audit record:
 
-### Timezone
+```ts
+interface SigningAuditRecord {
+  action: SigningAction;
+  allowed: boolean;
+  reason: string;
+  timestamp: string;
+}
+```
 
-- All timestamps are normalized to **UTC** and exported as ISO-8601 strings
-  with a `Z` suffix (`createdAt.toISOString()`).
-- No local-time conversion is performed; the export is timezone-independent.
+- Audit records are emitted for both allowed and denied decisions so denials
+  are observable.
+- Audit records, logs, and error messages are passed through a redaction helper
+  that strips secret-shaped values (secret keys, tokens, credentials) before
+  they are written. Raw key material is never included in an audit record.
+- Denied actions fail closed: the signing boundary throws and the request is
+  rejected rather than falling back to an unsigned or client-signed path.
 
-### Reversal Entries
+### Non-Custodial Defaults
 
-- Cancelled or reversed streams emit reversal lines that negate the original
-  posting (same `entryId` prefix, `reversal: true`, negated amount).
-- Reversals reference the original `transactionHash` so provenance is preserved
-  and the pair can be reconciled.
-
-### Golden-File Tests
-
-Representative lifecycle histories (create → top-up → withdraw → complete, and
-create → cancel) are covered by golden-file tests under
-`src/services/accounting-export/__tests__/`. Each fixture asserts the full
-exported journal, including identifiers, rounding, fees, timezone, and reversal
-entries, plus failure cases (missing transaction hash, unknown event type) and
-boundary cases (zero-amount events, maximum stroop values).
+- With no policy configured, all custodial signing is denied.
+- Only `top-up` is a custodial action; withdraw, pause, resume, and create
+  remain wallet-signed and are never routed through the signing boundary.
+- Tests cover denied actions, audit record emission, and secret redaction to
+  keep the boundary enforced.
