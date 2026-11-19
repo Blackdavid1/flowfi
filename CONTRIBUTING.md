@@ -15,6 +15,18 @@ Thanks for helping improve this project. This guide covers local setup, the chec
 - Update the owning API, contract, operational, or contributor documentation alongside code changes.
 - Do not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements.
 
+## System context and trust boundaries
+
+The versioned system context and trust-boundary map lives in [`backend/docs/SYSTEM_CONTEXT.md`](backend/docs/SYSTEM_CONTEXT.md). It is the single maintained view of the browser, wallet, API, worker, database, RPC, and external-provider boundaries, and links each boundary to its owning code paths and the data flows that cross it.
+
+When a change moves, adds, or removes a trust boundary (a new external provider, a new worker, a new privileged code path), update `SYSTEM_CONTEXT.md` in the same pull request:
+
+- Bump the document's `Version` and add a row to its changelog.
+- Keep the boundary table's owning-code links pointing at real files.
+- Keep the Mermaid diagram blocks intact so the validation check can parse them.
+
+The referenced code paths and diagram markers are validated automatically (see the document's *Validation* section). Run the check locally before opening a pull request; a missing referenced path or a malformed diagram block fails the check.
+
 ## Dependency outage game days
 
 Game days exercise operator response to dependency outages in an isolated environment. They are repeatable: run the same scenarios on a schedule and compare outcomes across runs.
