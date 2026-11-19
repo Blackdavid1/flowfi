@@ -3,10 +3,10 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, and the
+repeatable dependency-outage game days. It is written for operators and
+on-call engineers. All public interfaces described here are additive;
+existing endpoints and configuration keys keep working unless noted.
 
 ---
 
@@ -168,36 +168,69 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Metrics
+## 4. Dependency outage game days
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+Game days exercise operator response to outages of the indexer's external
+dependencies: **database**, **cache**, **Soroban RPC**, and **webhook
+provider**. They are repeatable, isolated, and never touch production.
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+### Isolation requirements
+
+- Run against a dedicated, disposable environment (ephemeral database, cache,
+  RPC endpoint, and webhook sink). Never point a game day at production data
+  or production provider credentials.
+- Use a dedicated indexer replica with its own lease/cursor so a game day
+  cannot advance the production cursor.
+- Fault injection is applied at the dependency boundary (network block, proxy
+  error, or provider stub), not by editing application code.
+- **Production execution stays behind explicit approval.** Game days never
+  auto-run against production; any production-affecting step requires a
+  recorded human approval before it starts.
+
+### Scenarios
+
+For each scenario, inject the fault, observe detection, then remove the fault
+and observe recovery. Record the outcome in the table below.
+
+| Scenario | Injection | Expected detection | Expected recovery |
+| --- | --- | --- | --- |
+| Database outage | Block DB connections / stop DB | Lease renewal fails; worker stops advancing cursor; errors logged and counted | Reconnect; lease re-acquired; cursor resumes from last committed ledger |
+| Cache outage | Stop cache / return errors | Cache misses fall through to source; elevated latency and cache-error metrics | Cache restored; hit rate returns to baseline |
+| Soroban RPC outage | Return 5xx / timeouts from RPC | Retry/backoff engages; poll pauses; RPC error metrics rise | RPC restored; backoff clears; polling resumes without skipping ledgers |
+| Webhook provider outage | Return 5xx / timeouts from webhook sink | Delivery retries with backoff; failures counted; no data loss | Provider restored; queued deliveries drain; backlog returns to zero |
+
+### Fail-closed requirement (no unsafe mutation fallback)
+
+During any outage the indexer must **fail closed**: it pauses or retries and
+never falls back to an unsafe mutation path (e.g., advancing the cursor
+without applying events, writing partial state, or bypassing fencing).
+Operators must confirm for every scenario that:
+
+- The cursor did not advance past unapplied ledgers.
+- No partial or speculative writes were committed.
+- Fencing and lease checks were still enforced.
+- No secret or credential was logged or exposed during the fault.
+
+### Recording outcomes
+
+Record each run in a structured entry so game days are repeatable and
+comparable across runs:
+
+```
+scenario: <database|cache|soroban-rpc|webhook>
+runId: <unique id>
+startedAt / endedAt: <ISO-8601 timestamps>
+detection: <signal observed + time to detect>
+recovery: <signal observed + time to recover>
+failClosed: <true|false>  # must be true
+unsafeFallbackObserved: <true|false>  # must be false
+notes: <free text>
+```
+
+A game day passes only when every scenario records `failClosed: true` and
+`unsafeFallbackObserved: false`. Any failure is treated as a defect and
+blocks the related release until fixed.
