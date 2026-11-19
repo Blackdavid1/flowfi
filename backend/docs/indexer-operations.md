@@ -3,10 +3,10 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, and the
+blue-green database connection cutover procedure. It is written for operators
+and on-call engineers. All public interfaces described here are additive;
+existing endpoints and configuration keys keep working unless noted.
 
 ---
 
@@ -168,36 +168,122 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Metrics
+## 4. Blue-green database connection cutover
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+### Objective
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+Move application instances (API and indexer worker) between database endpoints
+during maintenance **without routing writes to an unverified target**. The
+cutover is blue-green: the current endpoint (blue) keeps serving until the
+target endpoint (green) passes readiness checks, and a single rollback path
+returns traffic to blue if any check fails.
+
+### Readiness checks (must all pass before routing writes)
+
+Run these against the **target (green)** endpoint before switching:
+
+1. **Reachability.** `pg_isready -h <green-host> -p <green-port>` succeeds.
+2. **Schema parity.** The target reports the same applied migration version as
+   the current endpoint (`SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1`).
+3. **Replication lag.** If green is a replica being promoted, lag is below the
+   configured threshold (`pg_last_wal_receive_lsn()` vs. `pg_last_wal_replay_lsn()`).
+4. **Write probe.** A transaction-scoped probe write to a scratch table
+   succeeds and is rolled back; no application data is mutated.
+5. **Lease sanity.** The indexer lease table is present and readable on green
+   so the worker can re-acquire ownership after cutover.
+
+If any check fails, **do not cut over**; keep blue serving and investigate.
+
+### Cutover procedure (operator commands)
+
+1. **Pause the worker** so no cursor writes race the switch. The worker stops
+   advancing the cursor and releases ownership locally; in-flight polls finish
+   or are cancelled per the graceful-shutdown policy.
+   ```
+   kubectl -n <ns> scale deploy/indexer-worker --replicas=0
+   ```
+2. **Drain the API.** Remove API pods from the load balancer and wait for
+   in-flight requests to complete (connection draining), so no request is
+   mid-transaction during the switch.
+   ```
+   kubectl -n <ns> rollout pause deploy/api
+   ```
+3. **Run readiness checks** against green (section above). Abort on any
+   failure.
+4. **Point the connection secret at green** and restart consumers so they
+   re-establish connections to the new endpoint.
+   ```
+   kubectl -n <ns> create secret generic db-conn \
+     --from-literal=DATABASE_URL="$GREEN_DATABASE_URL" \
+     --dry-run=client -o yaml | kubectl apply -f -
+   kubectl -n <ns> rollout restart deploy/api
+   ```
+5. **Resume the worker** and confirm it re-acquires the lease and advances the
+   cursor on green.
+   ```
+   kubectl -n <ns> scale deploy/indexer-worker --replicas=<n>
+   ```
+6. **Verify** API health and that the indexer cursor is advancing (metrics in
+   section 6).
+
+### Rollback procedure
+
+Rollback is the same sequence with the endpoints swapped. Trigger rollback if
+any readiness check fails after the switch, if the worker cannot re-acquire the
+lease, or if API error rate rises above threshold.
+
+1. **Pause the worker** (`scale deploy/indexer-worker --replicas=0`).
+2. **Drain the API** (`rollout pause deploy/api`).
+3. **Point the connection secret back at blue** and restart the API.
+   ```
+   kubectl -n <ns> create secret generic db-conn \
+     --from-literal=DATABASE_URL="$BLUE_DATABASE_URL" \
+     --dry-run=client -o yaml | kubectl apply -f -
+   kubectl -n <ns> rollout restart deploy/api
+   ```
+4. **Resume the worker** and confirm the lease is re-acquired and the cursor
+   advances on blue.
+
+### Behavior during cutover
+
+- **In-flight API requests** complete against the endpoint they started on;
+  draining ensures no request spans the switch. New requests after restart use
+  the new endpoint.
+- **Worker pause/resume.** While paused, no cursor writes occur. On resume the
+  worker re-establishes its connection pool and re-acquires the lease; fencing
+  prevents a stale owner from writing to the wrong endpoint.
+- **Connection re-establishment.** Restarting consumers forces fresh
+  connections; pooled connections to the old endpoint are discarded rather than
+  reused.
+
+### Failure and boundary cases
+
+- **Target unreachable.** Readiness check 1 fails; cutover aborts, blue keeps
+  serving.
+- **Partial cutover.** If the secret is updated but a consumer fails to
+  restart, that consumer keeps its old connections until restarted; re-run the
+  restart step. The worker stays paused until verified.
+- **Rollback path.** Any post-switch failure follows the rollback procedure
+  above; the worker is paused first so no writes land on the wrong endpoint
+  mid-rollback.
+
+---
+
+## 5. Soroban RPC retry/backoff, graceful shutdown, and poll cancellation
+
+See the sections below for the RPC retry/backoff policy, graceful shutdown, and
+poll cancellation behavior. These are unchanged by the cutover procedure; the
+worker pause/resume above reuses the existing graceful-shutdown path.
+
+---
+
+## 6. Indexer metrics
+
+Operators watch the indexer metrics (lease acquisition/renewal, rejected stale
+writes, cursor position, poll latency) to confirm health after a cutover. A
+healthy post-cutover state shows the lease held by exactly one worker and the
+cursor advancing.
