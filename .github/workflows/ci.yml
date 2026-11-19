@@ -44,3 +44,31 @@ jobs:
 
       - name: Run policy fixtures
         run: node --test .github/scripts/issue-link-policy.test.mjs
+
+  accessibility-audit:
+    name: Accessibility critical-flow audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run automated accessibility checks
+        working-directory: frontend
+        run: npm run test:a11y
+
+      - name: Upload accessibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-report
+          path: frontend/a11y-report/
+          if-no-files-found: ignore

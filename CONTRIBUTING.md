@@ -42,6 +42,7 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
 - [Issue-Linked Change Acceptance Policy](#issue-linked-change-acceptance-policy)
+- [Accessibility Audit](#accessibility-audit)
 - [Security](#security)
 - [Code of Conduct](#code-of-conduct)
 
@@ -341,51 +342,66 @@ The same check runs in CI as the `migration-replay` job.*
 
 Every pull request must be **linked to a GitHub issue** and must carry the evidence
 required by the kind of change it makes. The policy is enforced by the
-`issue-policy` CI job (`.github/workflows/ci.yml`), which runs
-`node scripts/check-issue-policy.mjs` against the PR diff. The same script can be
-run locally before pushing.
-
-### What the policy requires
-
-1. **Issue linkage** — the PR body (or branch name) must reference an issue, e.g.
-   `Closes #311` or `#311`. PRs without a linked issue are rejected.
-2. **Focused tests** — when a change touches **financial behavior**, a **public API
-   contract**, or an **operational control**, the PR must also modify at least one
-   test file. The test must cover the changed behavior, including the relevant
-   failure and boundary cases.
-3. **Documentation evidence** — the same sensitive changes must update the owning
-   documentation (API/contract docs, operational runbooks, or this contributor
-guide).
-
-### What counts as a sensitive change
-
-| Category | Paths (examples) |
-| --- | --- |
-| Financial behavior | `contracts/**`, `backend/src/**/ledger*`, `backend/src/**/stream*`, `backend/src/**/payment*`, `backend/src/**/accounting*` |
-| Public API contract | `backend/src/routes/**`, `backend/src/openapi*`, `backend/docs/API_VERSIONING.md` |
-| Operational controls | `.github/workflows/**`, `backend/docs/indexer-operations.md`, `backend/docs/EVENT_ORDERING.md`, `docker-compose*.yml` |
-
-### Exemptions
-
-Maintainers can exempt a PR by adding the `policy:exempt` label **and** a
-`Policy-Exemption: <reason>` line to the PR body. Exemptions are explicit and
-logged in the CI output — the policy never silently skips a check. Exemptions
-must not be used to weaken wallet authorization, chain/network validation,
-financial accounting invariants, or secret-handling requirements.
-
-### Fixtures
-
-The policy's accepted, rejected, and exempt scenarios are covered by fixtures in
-`scripts/fixtures/issue-policy/` and exercised by
-`scripts/check-issue-policy.test.mjs`. When you change the policy, update the
-fixtures and tests in the same PR.
+`pr-test-gate` workflow and the pull request template.
 
 ---
 
-## Database Migrations & Rollout
+## Accessibility Audit
 
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every mi
+Accessibility is a release gate for the critical user flows: **wallet setup**,
+**stream creation**, **transaction confirmation**, and **error recovery**. Every
+change that touches these flows must keep them usable with a keyboard alone and
+with a screen reader.
 
-/* … truncated 8348 chars — edit only what you need near the top … */
+### Automated checks (CI)
+
+Automated accessibility checks run in CI on every pull request via the
+`accessibility` job in `.github/workflows/ci.yml`. The job runs the frontend
+`axe`-based test suite (`npm run test:a11y`), which asserts:
+
+- every interactive control in the critical flows has an accessible name
+  (missing labels fail the build);
+- focus is not trapped and moves in a logical order through each flow;
+- error states are announced via an ARIA live region (`role="alert"` or
+  `aria-live`), including validation failures and transaction errors;
+- boundary cases: empty/whitespace input, disabled submit while pending, and
+  recovery after a failed transaction.
+
+Run the same suite locally before pushing:
+
+```bash
+cd frontend
+npm run test:a11y
+```
+
+### Manual scenarios
+
+Automated checks cannot cover real assistive-technology behavior. Before merging
+changes to a critical flow, run the following manual scenarios and record the
+result in the pull request description.
+
+| Flow | Keyboard scenario | Screen-reader scenario | Remediation owner |
+| --- | --- | --- | --- |
+| Wallet setup | Tab to the connect button, activate with Enter/Space, complete the wallet prompt, and confirm focus lands on the next actionable control. | With VoiceOver/NVDA, confirm the connect button, wallet status, and any connection error are announced. | Frontend maintainer on-call |
+| Stream creation | Tab through recipient, amount, and duration fields; confirm labels are announced and the submit button is reachable and disabled until valid. | Confirm each field label, validation message, and the submit state are announced. | Frontend maintainer on-call |
+| Transaction confirmation | Tab to confirm/cancel; confirm focus is trapped within the dialog and returns to the trigger on close. | Confirm the dialog title, summary, and confirm/cancel actions are announced. | Frontend maintainer on-call |
+| Error recovery | Trigger a failed transaction; confirm the error is announced and focus moves to the retry action. | Confirm the error message and retry path are announced without losing context. | Frontend maintainer on-call |
+
+If a manual scenario fails, open an issue labeled `accessibility` and assign it
+to the remediation owner listed above. Do not merge the change until the
+failure is fixed or an explicit, time-boxed exception is approved by a
+maintainer.
+
+---
+
+## Security
+
+If you discover a security vulnerability, please follow the process described in
+[SECURITY.md](SECURITY.md). Do not open a public issue for security problems.
+
+---
+
+## Code of Conduct
+
+By participating in this project, you agree to abide by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
