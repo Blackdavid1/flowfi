@@ -13,6 +13,7 @@
     "test:integration:docker": "docker compose up -d postgres && vitest run tests/integration/stream-lifecycle.test.ts; docker compose stop postgres",
     "test:e2e:testnet": "vitest run --config e2e/testnet/vitest.config.ts",
     "test:gameday": "vitest run --config gameday/vitest.config.ts",
+    "test:security": "vitest run tests/security",
     "gameday": "tsx gameday/run.ts",
     "dev": "nodemon",
     "build": "tsc",
