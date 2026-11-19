@@ -17,6 +17,57 @@ Thanks for helping improve this project. This guide covers local setup, the revi
 - A PR may be merged once it has an approving review, green CI, and no unresolved blocking comments.
 - If you must step away from an owned task, hand it off explicitly in the PR thread so ownership is never ambiguous.
 
+## Advanced task ownership and review workflow
+
+Substantial work (multi-file features, contract or accounting changes, deployment or security-sensitive work) needs more structure than a single PR. Use the workflow below so scope, dependencies, and evidence are explicit before review begins.
+
+### Claiming substantial work
+
+1. **Claim before you build.** Comment on the tracking issue that you are taking ownership, and link the issue from your draft PR. One owner per task; do not start parallel work on the same task without agreeing on a split first.
+2. **Write the scope down.** In the issue or PR description, state what is in scope, what is explicitly out of scope, and the acceptance criteria you will satisfy. Keep it aligned with the repository's issue and pull request templates.
+3. **Open a draft PR early.** Draft PRs signal ownership and let maintainers follow along without implying the change is ready.
+4. **Hand off explicitly.** If you step away, post a handoff note in the issue and PR thread naming the new owner and current state.
+
+### Splitting dependent tasks
+
+When a task depends on other work, split it into tracked sub-issues instead of one large PR:
+
+- Create a sub-issue per independently reviewable unit (for example: shared type/util, contract change, backend consumer, docs).
+- Link sub-issues to the parent with a task list and note the dependency order (which must land first).
+- Land foundational changes (types, shared utilities, migrations) before their consumers so each PR stays reviewable on its own.
+- Keep each PR scoped to one sub-issue; reference the parent issue so reviewers can see the whole picture.
+
+### Requesting design review
+
+Request design review early for changes that touch public interfaces, contract entrypoints, accounting invariants, or deployment/security behavior:
+
+- Open a draft PR or issue comment describing the proposed approach, alternatives considered, and the interfaces that change.
+- Tag a maintainer familiar with the area and state exactly what feedback you need (interface shape, migration path, invariant coverage).
+- Resolve design questions before investing in full implementation; record the agreed approach in the PR description.
+- Keep existing interfaces compatible unless the change explicitly versions them, and call out any versioning in the design review request.
+
+### Reviewer expectations
+
+Reviewers should confirm, and authors should make easy to confirm:
+
+- **Scope** — the PR matches its stated scope and does not include unrelated changes.
+- **Tests** — focused automated coverage exists for the changed behavior, including the relevant failure and boundary cases (see [Automated coverage](#automated-coverage)).
+- **Documentation** — the owning documentation (API, contract, operational, or contributor docs) is updated alongside the behavior change.
+- **Compatibility** — existing interfaces remain compatible unless explicitly versioned.
+- **Safety** — wallet authorization, chain/network validation, financial accounting invariants, and secret-handling requirements are not weakened.
+
+### Evidence for financial and security-sensitive changes
+
+Changes that affect funds, accounting, authorization, or secrets must include evidence in the PR description so reviewers can verify without guessing:
+
+- **Tests** — link the automated tests that cover the change, including failure and boundary cases (unauthorized callers, terminal-state calls, malformed or empty parameters, mismatched network/chain ID).
+- **Invariant checks** — state which financial accounting invariants the change preserves and how the tests exercise them (for example balances reconcile, no double-spend, terminal states are final).
+- **Audit notes** — summarize the risk surface, the authorization model touched, and any known limitations or follow-ups.
+- **Secret handling** — confirm no secrets are committed and that required credentials come from the environment; never substitute placeholder or shared credentials.
+- **Rollback** — describe how to safely revert or disable the change if it misbehaves after merge.
+
+Do not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements to make a change pass.
+
 ## Multi-network deployment decision guide
 
 Operators must select and verify a consistent combination of **network, contract, token, endpoint, and release artifact** for each environment. Mixing values across environments is the most common cause of failed or unsafe deployments.
