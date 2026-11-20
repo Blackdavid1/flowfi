@@ -10,6 +10,41 @@ unless noted.
 
 ---
 
+## 0. Field-level privacy and retention inventory
+
+This inventory maps every wallet-linked field family the indexer touches to
+its data store, purpose, retention rule, deletion constraint, and owner. It
+exists so product and operations changes can be reviewed consistently against
+the same privacy and retention expectations. Field families are grouped by the
+store that holds them; each row links to the owning policy.
+
+### Field families
+
+| Field family | Data store | Purpose | Retention rule | Deletion constraint | Owner | Policy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `wallet_address` (sender/recipient) | `streams`, `events` tables | Stream/event indexing and per-wallet history | Retained for the life of the indexed ledger record; no TTL | Cannot be deleted while the stream is referenced by an event; deletion requires a replay/reset of the affected ledger range | Indexer team | `SECURITY.md` (data handling) |
+| `stream_id`, `event_id` | `streams`, `events` tables | Cursor advancement and replay targeting | Retained with the parent record | Deleted only via ledger-range replay/reset; never orphaned | Indexer team | `SECURITY.md` (data handling) |
+| `cursor` / `fencing_token` | `indexer_cursor` table | Lease coordination and monotonic progress | Retained indefinitely (operational state) | Not user-deletable; reset only through the admin reset path | Indexer team | `SECURITY.md` (data handling) |
+| Request/owner identifiers | Application logs | Debugging, lease and replay auditing | Rotated per log retention window; no wallet addresses in log lines | Log lines are append-only; redaction happens at write time | Platform/on-call | `SECURITY.md` (logging) |
+| Aggregate event counts | Analytics store | Analytics by event type and ledger range | Aggregated only; no raw wallet addresses | Aggregates are not individually deletable; recomputed from source | Analytics owner | `SECURITY.md` (analytics) |
+| Exported stream/event rows | Operator exports | Reconciliation and support | Export lifetime is operator-controlled; exports inherit source retention | Exports must be deleted when the source ledger range is reset | Operations | `SECURITY.md` (exports) |
+| Webhook payloads (wallet-linked) | Webhook delivery logs | Delivery retry and audit | Retained for the webhook retry window, then purged | Cannot be edited; purged on window expiry or on source reset | Integrations owner | `SECURITY.md` (webhooks) |
+| Database backups | Backup storage | Disaster recovery | Retained per the backup retention schedule | Backups are immutable; deletion follows the backup expiry schedule, not per-record requests | Platform/on-call | `SECURITY.md` (backups) |
+
+### Review rules
+
+- Every new wallet-linked field family **must** be added to this table with a
+  store, purpose, retention rule, deletion constraint, owner, and policy link
+  before it ships.
+- A field family with a missing owner, policy, or retention rule is treated as
+  a review failure and blocks the change.
+- Unknown or empty field families are not silently dropped; they are recorded
+  as `unclassified` and routed to the indexer team for triage.
+- Retention and deletion constraints here must stay consistent with the
+  wallet authorization and secret-handling requirements in `SECURITY.md`.
+
+---
+
 ## 1. Poll ownership lease
 
 ### Behavior
@@ -168,36 +203,4 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
-
----
-
-## 4. Metrics
-
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
-
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+  the lease is rejected by the same fencing check that guards cursor writes.
