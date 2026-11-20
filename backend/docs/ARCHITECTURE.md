@@ -11,6 +11,64 @@ timing, environment variables, and operational runbook) see
 
 ---
 
+## Financial Language & Risk-Disclosure Glossary
+
+This glossary is the canonical definition of the financial terms surfaced in the
+UI and API. Every user-facing label, API field description, and docs page must
+use these terms with the meanings below. When a value is derived rather than
+observed on-chain, the caveat column is mandatory disclosure.
+
+| Term | Definition | Authoritative Source | Caveats / Risk Disclosure |
+|------|------------|----------------------|---------------------------|
+| **Streamed** | The portion of a stream's total amount that has vested by elapsed time up to the current ledger timestamp. | Contract `streamed_amount` view / `SorobanEventWorker` recomputation from `startTime`, `ratePerSecond`, and ledger time. | Time-based estimate between ledgers; not a settled balance. Do not present as withdrawable. |
+| **Claimable** | The amount the recipient can withdraw right now: streamed amount minus already-withdrawn amount, clamped to the stream's remaining balance. | Contract `claimable_amount` view; mirrored by backend `withdrawnAmount` accounting. | Depends on the latest indexed ledger; may lag chain state by one poll interval. Never treat as guaranteed until a withdraw transaction confirms. |
+| **Deposited** | The total amount the sender has funded into the stream (initial deposit plus any top-ups). | Contract `deposited_amount`; backend `Stream.depositedAmount` written by the indexer on `created` / `topped_up` events. | Custodial top-ups are server-signed via `KEEPER_SECRET_KEY`; a pending top-up is not yet deposited until the transaction is confirmed and indexed. |
+| **Withdrawn** | The cumulative amount the recipient has successfully claimed from the stream. | Contract `withdrawn_amount`; backend `Stream.withdrawnAmount` updated on `withdrawn` events. | Additive mutation — the dual-indexer race (issue #808) can cause last-writer-wins drift until consolidation (issue #801). Treat as eventually consistent. |
+| **Estimated** | Any value computed client- or server-side from time math rather than read from a confirmed on-chain state. | Frontend `useStreamEvents` projections; backend simulate endpoints (fee estimation only). | Must be labeled "estimated" in the UI. Never used for accounting, authorization, or payout decisions. |
+| **Finalized** | A value backed by a confirmed, indexed on-chain transaction/event. | `StreamEvent` rows with a confirmed `transactionHash`; `Stream` fields written by `SorobanEventWorker`. | Finalized values can still be superseded by later events (e.g. a subsequent withdraw), but are never rolled back by estimation. |
+| **Stale** | A displayed value whose backing indexer cursor has not advanced within the expected poll window, so it may no longer reflect chain state. | `IndexerState` cursor freshness vs. `SorobanEventWorker` poll interval; SSE heartbeat gaps. | Stale values must be visibly flagged in the UI and must not be treated as finalized. Recovery is via `replayFromLedger` (see `indexerService.ts`). |
+
+### Consistency Rules
+
+1. **Estimated vs. finalized.** Any value derived from time math is
+   *estimated*; only values written from confirmed `StreamEvent` rows are
+   *finalized*. UI must not render an estimated value with finalized styling.
+2. **Stale vs. finalized.** If the `IndexerState` cursor is behind the expected
+   poll window, all derived values are *stale* until the worker catches up. Stale
+   is a superset of estimated: a stale finalized value is still stale.
+3. **Claimable ≤ streamed − withdrawn.** This invariant must hold in every
+   surface; a violation indicates indexer drift, not a UI bug.
+4. **Deposited is monotonic.** Deposited only increases (deposit + top-ups); a
+   decrease signals a data-integrity failure and must be surfaced, not hidden.
+
+### Key UI & API Surfaces
+
+These surfaces must use the glossary terms verbatim and honor the consistency
+rules above:
+
+| Surface | Terms Exposed | Notes |
+|---------|---------------|-------|
+| `GET /api/streams/:id` | streamed, claimable, deposited, withdrawn | Response fields map 1:1 to glossary terms; estimated fields are flagged. |
+| `GET /api/streams` (list) | streamed, claimable | List projections are estimated between polls. |
+| SSE `stream` events (`sse.service.ts`) | withdrawn, deposited, finalized | Event payloads are finalized once broadcast from the worker. |
+| `GET /api/indexer/status` (`indexerService.ts`) | stale | Reports cursor freshness used to compute staleness. |
+| Frontend `useStreamEvents` hook | estimated, stale | Client projections must be labeled estimated and flagged stale on heartbeat gaps. |
+
+### Automated Coverage
+
+Focused tests assert the glossary invariants and boundary transitions:
+
+- **Stale → finalized transition:** a value flagged stale becomes finalized once
+  the indexer cursor advances past the event ledger.
+- **Estimated → finalized transition:** an estimated claimable value is replaced
+  by the finalized on-chain value after the `withdrawn` event is indexed.
+- **Boundary:** claimable clamps to zero when withdrawn equals streamed, and to
+  the remaining balance when a top-up lands mid-stream.
+- **Failure:** a deposited decrease is rejected/surfaced rather than silently
+  applied.
+
+---
+
 ## Indexer Ownership Model
 
 Three files with overlapping names handle indexing and indexer management. Only
@@ -166,26 +224,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
