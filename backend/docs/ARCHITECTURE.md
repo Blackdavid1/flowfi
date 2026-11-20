@@ -11,6 +11,110 @@ timing, environment variables, and operational runbook) see
 
 ---
 
+## Architecture Decision Records
+
+Decision records capture the data ownership, authorization, idempotency, and
+on-chain/off-chain trade-offs that must be settled before introducing shared
+accounts (organizations) or recurring schedules. Each record compares viable
+alternatives, states the chosen option, and documents migration consequences.
+
+### ADR-001: Organization (Shared Account) Model
+
+**Status:** Proposed — requires review from contract and backend owners before
+implementation begins.
+
+**Context.** Users need to share streams and balances across a team. The
+question is where organization membership and ownership live.
+
+**Alternatives considered.**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| A. On-chain org registry (contract stores org → member mapping) | Membership is trustless and verifiable by any client; authorization enforced by the contract. | Every membership change is a transaction; higher gas and latency; contract upgrade required; wallet auth must still gate writes. |
+| B. Off-chain ownership table (backend `Organization` / `OrganizationMember` Prisma models) | Cheap, fast membership edits; no contract change; reuses existing wallet auth. | Backend becomes the authorization source of truth for shared resources; on-chain state cannot enforce org permissions; requires careful audit logging. |
+| C. Hybrid: off-chain membership, on-chain owner-of-record | Fast membership UX while the contract still sees a single owner address. | Two sources of truth for "who owns this stream"; reconciliation and revocation semantics are complex. |
+
+**Decision.** Adopt **Option B (off-chain ownership table)** for the initial
+release. Organization membership is stored in Prisma (`Organization`,
+`OrganizationMember` with a `role` enum) and enforced by the backend API. The
+contract continues to see a single owner address per stream; the backend maps
+that owner to the organization. This keeps existing contract interfaces
+compatible and avoids a contract upgrade.
+
+**Data ownership.**
+
+- **On-chain (source of truth):** stream balances, deposited/withdrawn amounts,
+  and the stream owner address. These are never derived from org tables.
+- **Off-chain (source of truth):** organization identity, membership, and roles.
+  The backend is authoritative for org authorization only.
+- **Mapping:** `Stream.ownerAddress` (on-chain) is linked to an
+  `OrganizationMember.walletAddress`; an org-scoped stream is one whose owner
+  address belongs to a member with the required role.
+
+**Authorization.** Wallet-based auth is unchanged: every request must present a
+signature from a wallet that is a member of the organization. Org roles
+(`OWNER`, `ADMIN`, `MEMBER`) gate org-scoped actions, but the wallet signature
+remains the primary credential. Chain/network validation is unchanged — the
+backend still verifies the transaction targets the configured network before
+acting. Org roles never bypass wallet authorization.
+
+**Migration consequences.** Adding org tables is additive (new migrations, no
+changes to existing `Stream` rows). Existing streams remain owned by their
+wallet address and are treated as personal until explicitly attached to an org.
+No contract migration is required. If a future ADR moves membership on-chain,
+the off-chain table becomes a cache and must be reconciled against the registry.
+
+### ADR-002: Recurring-Payment / Schedule Model
+
+**Status:** Proposed — requires review from contract and backend owners before
+implementation begins.
+
+**Context.** Users want recurring payments (e.g. salaries) instead of one-off
+streams. The question is where the schedule and its execution authority live.
+
+**Alternatives considered.**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| A. On-chain scheduler (contract holds schedule and releases funds per period) | Trustless execution; no backend liveness dependency; funds custody is on-chain. | Contract complexity and upgrade cost; every period is a transaction; harder to change cadence. |
+| B. Backend cron/keeper (backend triggers periodic stream creation or top-ups) | Reuses existing keeper-key flow and indexer; fast to ship; flexible cadence. | Backend liveness required; execution authority is a server key; must be idempotent to avoid double payments. |
+| C. Hybrid: on-chain stream, backend-scheduled top-ups | Leverages existing stream contract; backend only schedules funding. | Still depends on backend liveness for funding; partial on-chain guarantees. |
+
+**Decision.** Adopt **Option B (backend cron/keeper)** for the initial release,
+building on the existing `KEEPER_SECRET_KEY` server-signed flow. A `Schedule`
+Prisma model stores cadence, amount, and next-run time; a worker creates the
+next stream/top-up when due. This reuses the existing keeper authorization and
+indexer without a contract change.
+
+**Data ownership.**
+
+- **On-chain (source of truth):** each resulting stream's balances and the
+  confirmed transactions the keeper submits.
+- **Off-chain (source of truth):** the schedule definition (cadence, amount,
+  next-run time) and its run history.
+- **Mapping:** each `Schedule` run produces a stream/top-up transaction whose
+  hash is recorded on the schedule run row; the stream itself is authoritative
+  once indexed.
+
+**Authorization.** Schedule execution is delegated to the keeper key, which is
+scoped to funding operations only. The keeper cannot withdraw, change ownership,
+or move funds outside the schedule's configured amount. Creating or editing a
+schedule requires a wallet signature from the stream owner (or an org member
+with the required role per ADR-001). Chain/network validation applies to every
+keeper-submitted transaction exactly as for user-submitted ones.
+
+**Idempotency.** Each schedule run is keyed by `(scheduleId, periodIndex)` with a
+unique constraint so a retried or duplicated cron tick cannot double-pay. A run
+is marked complete only after the transaction is confirmed and indexed; a
+pending run is retried, not re-created.
+
+**Migration consequences.** Adding schedule tables is additive. Existing streams
+are unaffected and remain one-off. No contract migration is required. If a
+future ADR moves scheduling on-chain, the backend schedule becomes a mirror and
+must reconcile against on-chain state before disabling the cron.
+
+---
+
 ## Financial Language & Risk-Disclosure Glossary
 
 This glossary is the canonical definition of the financial terms surfaced in the
@@ -100,127 +204,4 @@ rows. Because they run on independent timers, they can race:
 - Both write to the same `Stream` row (upsert), so the last writer wins —
   usually harmless for immutable fields but problematic for additive mutations
   like `withdrawnAmount` (issue #808).
-- `StreamEvent` dedup via `@@unique([transactionHash, eventType])` prevents
-  duplicate event rows, but does **not** protect stream state mutations.
-
-**Mitigation:** Do not extend the legacy indexer. The consolidation (issue #801)
-will remove `SorobanIndexerService` entirely.
-
-### Naming Convention Plan
-
-The team convention is kebab-case with a `.service.ts` suffix. Once functional
-consolidation lands:
-
-| Current Name | Expected Future Name |
-|---|---|
-| `indexerService.ts` | `indexer.service.ts` |
-| `soroban-indexer.service.ts` | *(removed)* |
-
----
-
-## SSE Broadcast Flow
-
-The SSE (Server-Sent Events) subsystem delivers real-time contract event
-notifications to connected frontend clients. The full SSE architecture (scaling,
-memory, security) is documented in
-[`docs/SSE_ARCHITECTURE.md`](./SSE_ARCHITECTURE.md).
-
-### End-to-End Path
-
-```
-Soroban RPC
-    │  SorobanEventWorker polls for new contract events
-    ▼
-SorobanEventWorker (src/workers/soroban-event-worker.ts)
-    │  decode XDR → upsert Stream → insert StreamEvent
-    ▼
-PostgreSQL (via Prisma)
-    │  Stream + StreamEvent rows updated
-    ▼
-SSE broadcast (src/services/sse.service.ts)
-    │  sseService.broadcastToStream(streamId, event, data)
-    │  sseService.broadcastToUser(publicKey, event, data)
-    │  sseService.broadcastToAdmin(event, data)
-    │
-    ├──► [Single instance]  Direct write to in-memory client registry
-    │
-    └──► [Multi-instance]   Redis Pub/Sub
-                             │  publish to sse:stream:<id>, sse:user:<address>
-                             ▼
-                             All backend instances subscribe
-                             │  rebroadcast to local connected clients
-                             ▼
-                         Frontend (useStreamEvents hook)
-```
-
-### Broadcast Channels
-
-The worker uses three broadcast entry points depending on the event:
-
-| Method | When Used | Target Audience |
-|--------|-----------|-----------------|
-| `sseService.broadcastToStream(streamId, event, data)` | Stream lifecycle events (created, topped_up, withdrawn, cancelled, completed, paused, resumed) | Clients subscribed to that specific stream ID or `*` |
-| `sseService.broadcastToUser(publicKey, event, data)` | (Reserved for user-scoped events) | Clients subscribed to `user:<publicKey>` or `*` |
-| `sseService.broadcastToAdmin(event, data)` | Protocol-level events (fee_collected, fee_config_updated, admin_transferred) | The admin user identified by `ADMIN_PUBLIC_KEY` env var |
-
-### Multi-Instance Fanout
-
-When `REDIS_URL` is configured, broadcasts go through Redis Pub/Sub instead of
-direct in-memory writes:
-
-1. The originating instance publishes `{ event, data }` to
-   `sse:stream:<id>` or `sse:user:<address>`.
-2. Every backend instance subscribes via `psubscribe('sse:stream:*',
-   'sse:user:*')` and rebroadcasts to its own local clients.
-3. This means events reach all connected clients regardless of which backend
-   instance they are connected to.
-
-### Client Connection Limits
-
-| Limit | Default | Env Var |
-|-------|---------|---------|
-| Max SSE connections per server | 10,000 | `MAX_SSE_CONNECTIONS` |
-| Max connections per IP | 5 | Hardcoded |
-| Max connections per authenticated user | 10 | Hardcoded |
-
-Slow clients (write buffer ≥ 64 KB) are automatically dropped to protect
-throughput for healthy clients.
-
----
-
-## Keeper-Key Authorization Model
-
-FlowFi splits transaction signing into two categories: custodial (server-signed)
-and non-custodial (wallet-signed). The signing key determines who is responsible
-for the transaction.
-
-### Action Signing Matrix
-
-| Action | Signer | Mechanism |
-|--------|--------|-----------|
-| **Top-up** | Server (custodial) | Backend submits the transaction using `KEEPER_SECRET_KEY`. The frontend sends only the stream ID and amount. |
-| **Withdraw** | Wallet (non-custodial) | Frontend builds and signs the transaction via the connected wallet (Freighter). The backend simulate endpoint exists for fee estimation only. |
-| **Pause / Resume** | Wallet (non-custodial) | Same as withdraw — frontend-signed. Backend simulate endpoints exist for fee estimation but do not submit. |
-| **Create stream** | Wallet (non-custodial) | Frontend signs via wallet and submits directly to the Soroban RPC. |
-
-### The `KEEPER_SECRET_KEY`
-
-- Stored as an environment variable on the backend.
-- Loaded by `src/services/sorobanService.ts` via
-  `process.env.KEEPER_SECRET_KEY`.
-- Used **exclusively** by the top-up flow. The `topUpStream` function builds
-  the transaction, signs it with the keeper keypair, and submits it to the
-  Soroban RPC.
-- If `KEEPER_SECRET_KEY` is not configured, `topUpStream` throws
-  `'KEEPER_SECRET_KEY not configured'` and the request returns HTTP 500.
-- The cancel endpoint (`src/controllers/stream/cancel.ts`) also reads
-  `KEEPER_SECRET_KEY` but only to check whether the server wallet is configured;
-  the actual cancel transaction is wallet-signed by the sender.
-
-### Security Boundary
-
-> **Do not wire pause/resume/withdraw to a server-side submit path.** Only
-> `top-up` is intentionally custodial. All other mutating actions must be
-> wallet-signed by the user to preserve the non-custodial security model.
-
-The keeper key is a server-side secret and is never exposed to the frontend.
+- `StreamEvent` dedup via `@@unique([tr
