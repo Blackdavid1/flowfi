@@ -45,3 +45,43 @@ Focused automated coverage accompanies the change and includes:
 ### Compatibility
 
 Existing single-stream action interfaces are unchanged. The bulk review flow is additive and does not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements.
+
+## Transaction-safe drafts for incomplete stream setup (#268)
+
+A user can save an unsigned stream configuration as a draft and resume it later. A draft is a local, client-side record of an incomplete setup — it is **not** a stream and does **not** reserve funds.
+
+### What a draft is (and is not)
+
+- A draft captures only the configuration fields the user has entered so far (for example recipient, amount, duration, and start time).
+- A draft **never** contains secrets or signatures: no private keys, seed phrases, signed payloads, or wallet signatures are persisted. Signing happens only at the final review step, after the draft is loaded.
+- Saving a draft does **not** imply that funds are reserved, that a transaction was submitted, or that a stream already exists. The UI labels drafts explicitly as "Draft — not signed, no funds reserved" so this is unambiguous.
+
+### Expiry
+
+Drafts carry a creation timestamp and expire after a bounded window. Expired drafts are not offered for resume; the user is told the draft expired and must start a fresh setup. Expiry is evaluated on load so a stale draft cannot be silently resumed.
+
+### Network / chain changes
+
+Each draft records the chain/network it was created for. If the connected wallet is on a different network when the draft is loaded, the draft is not resumed automatically: the user is shown the mismatch and must either switch networks or discard the draft. Chain/network validation is never bypassed to make a draft load.
+
+### Schema upgrades
+
+Drafts are versioned. On load, a draft whose schema version is older than the current version is either migrated to the current shape or discarded if it cannot be safely migrated. Unknown or malformed drafts are discarded rather than partially applied, so an outdated draft can never produce an invalid configuration.
+
+### Final review before signing
+
+Resuming a draft always routes through a final review step that surfaces the full configuration (recipient, amount, duration, start time, and network) before any wallet interaction. Nothing is signed until the user confirms at this review, and the review makes clear that no funds have been reserved up to that point.
+
+### Testing
+
+Focused automated coverage accompanies the change and includes:
+
+- draft expiry (an expired draft is not resumable);
+- network/chain change (a draft created on another network is not resumed automatically);
+- schema upgrade (an older-version draft is migrated or discarded, never partially applied);
+- the final review step surfacing the full configuration before signing;
+- confirmation that persisted drafts contain no secrets or signatures.
+
+### Compatibility
+
+Draft persistence is additive and local to the frontend. Existing stream creation interfaces are unchanged, and the feature does not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements.
