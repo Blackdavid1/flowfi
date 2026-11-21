@@ -25,6 +25,42 @@ interface UseStreamEventsReturn {
   clearEvents: () => void;
 }
 
+/**
+ * Returns true when the user has requested reduced motion via the OS/browser
+ * `prefers-reduced-motion: reduce` media query. Consumers should use this to
+ * disable or minimize animations for live balance updates, charts, and
+ * transaction status transitions while preserving the information conveyed.
+ *
+ * Safe for SSR: returns false when `window`/`matchMedia` are unavailable.
+ */
+export function usePrefersReducedMotion(): boolean {
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      return;
+    }
+
+    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
+    setPrefersReducedMotion(query.matches);
+
+    const handleChange = (event: MediaQueryListEvent) => {
+      setPrefersReducedMotion(event.matches);
+    };
+
+    if (typeof query.addEventListener === 'function') {
+      query.addEventListener('change', handleChange);
+      return () => query.removeEventListener('change', handleChange);
+    }
+
+    // Fallback for older browsers without addEventListener on MediaQueryList.
+    query.addListener(handleChange);
+    return () => query.removeListener(handleChange);
+  }, []);
+
+  return prefersReducedMotion;
+}
+
 export function useStreamEvents(
   options: UseStreamEventsOptions = {}
 ): UseStreamEventsReturn {
@@ -148,24 +184,34 @@ export function useStreamEvents(
 
 // Example usage in a component:
 /*
-import { useStreamEvents } from '@/hooks/useStreamEvents';
+import { useStreamEvents, usePrefersReducedMotion } from '@/hooks/useStreamEvents';
 
 export function StreamDashboard({ streamId }: { streamId: string }) {
   const { events, connected, reconnecting, clearEvents } = useStreamEvents({
     streamIds: [streamId],
   });
+  const prefersReducedMotion = usePrefersReducedMotion();
 
   return (
     <div>
       <div className="flex items-center gap-2">
-        <div className={`h-2 w-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
-        <span>{connected ? 'Connected' : reconnecting ? 'Reconnecting...' : 'Disconnected'}</span>
+        <div
+          className={`h-2 w-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}
+          aria-hidden="true"
+        />
+        <span role="status" aria-live="polite">
+          {connected ? 'Connected' : reconnecting ? 'Reconnecting...' : 'Disconnected'}
+        </span>
         <button onClick={clearEvents}>Clear</button>
       </div>
 
       <div className="space-y-2">
         {events.map((event, i) => (
-          <div key={i} className="border p-3 rounded">
+          <div
+            key={i}
+            className="border p-3 rounded"
+            style={prefersReducedMotion ? { transition: 'none', animation: 'none' } : undefined}
+          >
             <div className="font-bold">{event.type}</div>
             <pre className="text-xs">{JSON.stringify(event.data, null, 2)}</pre>
             <div className="text-xs text-gray-500">
