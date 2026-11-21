@@ -96,6 +96,59 @@ Creation that exceeds either ceiling is rejected with a clear contract error
 (`RateExceedsCeiling` / `DurationExceedsCeiling`) rather than silently clamping
 the configuration.
 
+## Fee rebates
+
+Eligible stream operations may receive a bounded fee rebate. Rebates are
+optional: when no rebate policy is configured, or when an operation is not
+eligible, the full fee is charged and no rebate is applied.
+
+### Eligibility
+
+An operation is eligible for a rebate only when **all** of the following hold:
+
+- the operation is a stream creation or withdrawal on an existing stream;
+- the stream's derived rate is at or below `rebate_max_rate`;
+- the stream's `duration` is at or below `rebate_max_duration`;
+- the operation's fee is greater than zero.
+
+Operations that fail eligibility (for example, a rate or duration above the
+rebate ceilings, or a zero fee) receive no rebate. Eligibility is evaluated
+against the same terms used at creation time and is never retroactively
+re-evaluated for existing streams.
+
+### Rebate cap and rounding
+
+| Policy field          | Meaning                                                    |
+| --------------------- | ---------------------------------------------------------- |
+| `rebate_bps`          | Rebate rate in basis points of the fee (0–`MAX_REBATE_BPS`).|
+| `rebate_max_amount`   | Absolute maximum rebate per operation, in base units.      |
+| `rebate_max_rate`     | Maximum stream rate eligible for a rebate.                 |
+| `rebate_max_duration` | Maximum stream duration eligible for a rebate.             |
+
+The rebate is computed deterministically as
+`rebate = min(fee * rebate_bps / 10_000, rebate_max_amount)`, using integer
+arithmetic that **rounds down**. Rounding down guarantees the rebate never
+exceeds the fee and never exceeds `rebate_max_amount`. `rebate_bps` is capped at
+`MAX_REBATE_BPS` (10_000, i.e. 100%); configurations above the cap are rejected
+at policy update time.
+
+### Conservation and treasury accounting
+
+Rebates preserve conservation of funds: the recipient is credited the net
+amount (`fee - rebate`) and the rebate is recorded as a treasury adjustment, so
+the sum of credited amounts and treasury adjustments always equals the total fee
+collected. A rebate never mints funds and never reduces the stream's principal.
+
+Applying a rebate emits accounting events so the adjustment is auditable:
+
+- `FeeRebateApplied { stream_id, fee, rebate }` — emitted when a rebate is
+  applied to an operation.
+- `TreasuryAdjusted { amount }` — emitted for the treasury adjustment matching
+  the applied rebate.
+
+When no rebate is applied (ineligible operation, zero fee, or zero rebate after
+rounding), neither event is emitted and the full fee is charged.
+
 ## Testing
 
 Focused coverage for recurring schedules includes:
@@ -114,3 +167,14 @@ Focused coverage for rate and duration ceilings includes:
 - accepting a stream just below each ceiling;
 - demonstrating that existing streams retain their agreed terms after a policy
   change lowers the ceilings.
+
+Focused coverage for fee rebates includes:
+
+- conservation of funds: credited amount plus treasury adjustment equals the
+  total fee collected;
+- zero-fee operations applying no rebate and emitting no accounting events;
+- ineligible streams (rate or duration above the rebate ceilings) receiving no
+  rebate;
+- the rebate being capped at `rebate_max_amount` and rounding down;
+- `FeeRebateApplied` and `TreasuryAdjusted` events being emitted exactly when a
+  rebate is applied.

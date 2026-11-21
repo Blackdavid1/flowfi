@@ -27,6 +27,35 @@ pub struct StreamSponsored {
     pub amount: i128,
 }
 
+/// Emitted when a fee rebate is applied to an eligible stream operation.
+///
+/// `fee_charged` is the fee actually collected after the rebate, `rebate` is
+/// the amount returned to the payer, and `treasury_delta` is the net change to
+/// the treasury balance. Invariant: `fee_charged + rebate == gross_fee` and
+/// `treasury_delta == fee_charged`, so funds are conserved across the rebate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeRebateApplied {
+    pub stream_id: u64,
+    pub payer: Address,
+    pub gross_fee: i128,
+    pub rebate: i128,
+    pub fee_charged: i128,
+    pub treasury_delta: i128,
+}
+
+/// Emitted when the treasury balance is adjusted as part of rebate accounting.
+///
+/// Kept separate from `FeeRebateApplied` so treasury movements are auditable
+/// independently of the rebate decision that produced them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryAdjusted {
+    pub stream_id: u64,
+    pub delta: i128,
+    pub balance_after: i128,
+}
+
 pub fn emit_stream_created(
     env: &Env,
     stream_id: u64,
@@ -52,4 +81,33 @@ pub fn emit_stream_sponsored(env: &Env, stream_id: u64, sponsor: &Address, amoun
         amount,
     };
     env.events().publish(("stream_sponsored",), event);
+}
+
+pub fn emit_fee_rebate_applied(
+    env: &Env,
+    stream_id: u64,
+    payer: &Address,
+    gross_fee: i128,
+    rebate: i128,
+    fee_charged: i128,
+    treasury_delta: i128,
+) {
+    let event = FeeRebateApplied {
+        stream_id,
+        payer: payer.clone(),
+        gross_fee,
+        rebate,
+        fee_charged,
+        treasury_delta,
+    };
+    env.events().publish(("fee_rebate_applied",), event);
+}
+
+pub fn emit_treasury_adjusted(env: &Env, stream_id: u64, delta: i128, balance_after: i128) {
+    let event = TreasuryAdjusted {
+        stream_id,
+        delta,
+        balance_after,
+    };
+    env.events().publish(("treasury_adjusted",), event);
 }
