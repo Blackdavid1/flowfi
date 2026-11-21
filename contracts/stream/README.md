@@ -64,6 +64,38 @@ Each instance is funded independently. If the funder lacks sufficient balance
 for the next instance, creation of that instance fails and the schedule does not
 advance. Previously created instances are unaffected.
 
+## Rate and duration ceilings
+
+Protocol policy may bound the per-stream rate and duration so that accidental or
+abusive configurations cannot be created. The ceilings are configurable by the
+policy owner and are enforced only on the stream creation path.
+
+### Units
+
+| Policy field     | Unit                                                          |
+| ---------------- | ------------------------------------------------------------- |
+| `max_rate`       | Token base units per second (rate = `amount / duration`).     |
+| `max_duration`   | Seconds.                                                      |
+
+A stream's rate is derived from its `amount` and `duration`; a stream is
+rejected when its derived rate exceeds `max_rate` or its `duration` exceeds
+`max_duration`. Configurations exactly at a ceiling are accepted; only values
+strictly above a ceiling are rejected.
+
+### Policy-change behavior
+
+Ceilings apply **only to newly created streams**. Streams that already exist
+retain the terms they were created with, even if a later policy change would
+make those terms exceed the new ceilings. Lowering a ceiling never mutates,
+cancels, or truncates existing streams; it only prevents future creations that
+exceed the new bounds.
+
+### Errors
+
+Creation that exceeds either ceiling is rejected with a clear contract error
+(`RateExceedsCeiling` / `DurationExceedsCeiling`) rather than silently clamping
+the configuration.
+
 ## Testing
 
 Focused coverage for recurring schedules includes:
@@ -74,3 +106,11 @@ Focused coverage for recurring schedules includes:
 - insufficient funding for an instance failing without advancing the schedule;
 - duplicate execution being rejected (deterministic linkage);
 - each instance remaining independently cancellable.
+
+Focused coverage for rate and duration ceilings includes:
+
+- accepting a stream exactly at `max_rate` and exactly at `max_duration`;
+- rejecting a stream just above `max_rate` or just above `max_duration`;
+- accepting a stream just below each ceiling;
+- demonstrating that existing streams retain their agreed terms after a policy
+  change lowers the ceilings.

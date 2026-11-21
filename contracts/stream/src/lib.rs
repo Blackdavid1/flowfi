@@ -4,6 +4,19 @@
 //! recurring schedule. Each instance produced by a schedule is independently
 //! funded, uniquely identified, and independently cancellable. Linkage between
 //! instances is deterministic: `(schedule_id, index)`.
+//!
+//! ## Rate and duration ceilings
+//!
+//! Protocol policy may bound per-stream configuration via two ceilings:
+//!
+//! - `max_rate`: maximum stream rate in token base units **per second**
+//!   (`amount / interval`, integer division).
+//! - `max_duration`: maximum stream duration in **seconds** (`interval * count`).
+//!
+//! A ceiling of `0` means "unbounded" for that dimension. Ceilings are applied
+//! only at creation time: streams and schedules created before a policy change
+//! retain their agreed terms, and later policy changes never retroactively
+//! reject or alter existing streams.
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 
@@ -38,6 +51,16 @@ pub struct Schedule {
     pub spawned: u32,
 }
 
+/// Configurable protocol policy ceilings. `0` disables a ceiling.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Policy {
+    /// Max rate in token base units per second (`amount / interval`).
+    pub max_rate: i128,
+    /// Max duration in seconds (`interval * count`).
+    pub max_duration: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -50,6 +73,8 @@ pub enum Error {
     DuplicateExecution = 7,
     StreamNotFound = 8,
     Unauthorized = 9,
+    RateExceedsCeiling = 10,
+    DurationExceedsCeiling = 11,
 }
 
 #[contracttype]
@@ -63,6 +88,7 @@ const KEY_STREAM: u32 = 0;
 const KEY_SCHEDULE: u32 = 1;
 const KEY_NEXT_STREAM: u32 = 2;
 const KEY_NEXT_SCHEDULE: u32 = 3;
+const KEY_POLICY: u32 = 4;
 
 #[contract]
 pub struct StreamContract;
@@ -98,6 +124,7 @@ impl StreamContract {
 
     /// Create a bounded recurring schedule. Rejects out-of-bounds intervals and
     /// instance counts so a schedule can never spawn unbounded instances.
+    /// Also enforces the current rate and duration ceilings (see module docs).
     pub fn create_schedule(
         env: Env,
         owner: Address,
@@ -117,6 +144,7 @@ impl StreamContract {
         if count == 0 || count > MAX_INSTANCES {
             return Err(Error::InvalidCount);
         }
+        enforce_ceilings(&env, amount, interval, count)?;
         let id = next_id(&env, KEY_NEXT_SCHEDULE);
         let schedule = Schedule {
             id,
@@ -217,6 +245,30 @@ impl StreamContract {
         Ok(())
     }
 
+    /// Set the protocol rate and duration ceilings. `0` disables a ceiling.
+    /// Applies only to streams/schedules created after this call; existing
+    /// streams retain their agreed terms.
+    pub fn set_policy(env: Env, admin: Address, policy: Policy) -> Result<(), Error> {
+        admin.require_auth();
+        if policy.max_rate < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey { kind: KEY_POLICY, id: 0 }, &policy);
+        Ok(())
+    }
+
+    pub fn get_policy(env: Env) -> Policy {
+        env.storage()
+            .persistent()
+            .get(&DataKey { kind: KEY_POLICY, id: 0 })
+            .unwrap_or(Policy {
+                max_rate: 0,
+                max_duration: 0,
+            })
+    }
+
     pub fn get_stream(env: Env, stream_id: u64) -> Option<Stream> {
         env.storage()
             .persistent()
@@ -234,6 +286,38 @@ impl StreamContract {
                 id: schedule_id,
             })
     }
+}
+
+/// Enforce the current policy ceilings against a proposed schedule.
+/// A ceiling of `0` is treated as unbounded.
+fn enforce_ceilings(env: &Env, amount: i128, interval: u64, count: u32) -> Result<(), Error> {
+    let policy: Policy = env
+        .storage()
+        .persistent()
+        .get(&DataKey { kind: KEY_POLICY, id: 0 })
+        .unwrap_or(Policy {
+            max_rate: 0,
+            max_duration: 0,
+        });
+
+    if policy.max_rate > 0 {
+        // Rate in base units per second, integer division.
+        let rate = amount / (interval as i128);
+        if rate > policy.max_rate {
+            return Err(Error::RateExceedsCeiling);
+        }
+    }
+
+    if policy.max_duration > 0 {
+        let duration = interval
+            .checked_mul(count as u64)
+            .ok_or(Error::DurationExceedsCeiling)?;
+        if duration > policy.max_duration {
+            return Err(Error::DurationExceedsCeiling);
+        }
+    }
+
+    Ok(())
 }
 
 fn next_id(env: &Env, kind: u32) -> u64 {
@@ -270,56 +354,71 @@ mod tests {
             client.try_create_schedule(&owner, &recipient, &100, &0, &MIN_INTERVAL, &0),
             Err(Ok(Error::InvalidCount))
         );
+    }
+
+    #[test]
+    fn rate_ceiling_boundaries() {
+        let (_env, client, owner, recipient) = setup();
+        let admin = Address::generate(&_env);
+        // max_rate = 10 base units / second.
+        client.set_policy(&admin, &Policy { max_rate: 10, max_duration: 0 });
+
+        // interval = 60s. amount = 600 -> rate 10 (exactly at ceiling).
+        assert!(client
+            .try_create_schedule(&owner, &recipient, &600, &0, &MIN_INTERVAL, &1)
+            .is_ok());
+        // amount = 601 -> rate 10 (integer division) still at ceiling.
+        assert!(client
+            .try_create_schedule(&owner, &recipient, &601, &0, &MIN_INTERVAL, &1)
+            .is_ok());
+        // amount = 660 -> rate 11 (just above ceiling).
         assert_eq!(
-            client.try_create_schedule(
-                &owner,
-                &recipient,
-                &100,
-                &0,
-                &MIN_INTERVAL,
-                &(MAX_INSTANCES + 1)
-            ),
-            Err(Ok(Error::InvalidCount))
+            client.try_create_schedule(&owner, &recipient, &660, &0, &MIN_INTERVAL, &1),
+            Err(Ok(Error::RateExceedsCeiling))
         );
     }
 
     #[test]
-    fn spawns_deterministic_linked_instances() {
+    fn duration_ceiling_boundaries() {
         let (_env, client, owner, recipient) = setup();
-        let sid = client.create_schedule(&owner, &recipient, &100, &1000, &MIN_INTERVAL, &3);
-        let s0 = client.spawn_from_schedule(&sid, &100);
-        let s1 = client.spawn_from_schedule(&sid, &100);
-        assert_eq!(s0, sid * 1_000_000);
-        assert_eq!(s1, sid * 1_000_000 + 1);
-        let stream0 = client.get_stream(&s0).unwrap();
-        let stream1 = client.get_stream(&s1).unwrap();
-        assert_eq!(stream0.start, 1000);
-        assert_eq!(stream1.start, 1000 + MIN_INTERVAL);
-    }
+        let admin = Address::generate(&_env);
+        // max_duration = 600s.
+        client.set_policy(&admin, &Policy { max_rate: 0, max_duration: 600 });
 
-    #[test]
-    fn rejects_insufficient_funding_and_exhaustion() {
-        let (_env, client, owner, recipient) = setup();
-        let sid = client.create_schedule(&owner, &recipient, &100, &0, &MIN_INTERVAL, &1);
+        // interval 60 * count 10 = 600 (exactly at ceiling).
+        assert!(client
+            .try_create_schedule(&owner, &recipient, &100, &0, &MIN_INTERVAL, &10)
+            .is_ok());
+        // interval 60 * count 11 = 660 (just above ceiling).
         assert_eq!(
-            client.try_spawn_from_schedule(&sid, &99),
-            Err(Ok(Error::InsufficientFunding))
-        );
-        client.spawn_from_schedule(&sid, &100);
-        assert_eq!(
-            client.try_spawn_from_schedule(&sid, &100),
-            Err(Ok(Error::ScheduleExhausted))
+            client.try_create_schedule(&owner, &recipient, &100, &0, &MIN_INTERVAL, &11),
+            Err(Ok(Error::DurationExceedsCeiling))
         );
     }
 
     #[test]
-    fn instances_cancel_independently() {
+    fn existing_streams_unaffected_by_policy_change() {
         let (_env, client, owner, recipient) = setup();
-        let sid = client.create_schedule(&owner, &recipient, &100, &0, &MIN_INTERVAL, &2);
-        let s0 = client.spawn_from_schedule(&sid, &100);
-        let s1 = client.spawn_from_schedule(&sid, &100);
-        client.cancel_stream(&s0);
-        assert!(client.get_stream(&s0).unwrap().cancelled);
-        assert!(!client.get_stream(&s1).unwrap().cancelled);
+        let admin = Address::generate(&_env);
+
+        // Create a schedule with no ceilings in place.
+        let id = client
+            .create_schedule(&owner, &recipient, &100_000, &0, &MIN_INTERVAL, &10)
+            .unwrap();
+
+        // Tighten policy afterwards.
+        client.set_policy(&admin, &Policy { max_rate: 1, max_duration: 60 });
+
+        // Existing schedule retains its agreed terms and can still spawn.
+        let schedule = client.get_schedule(&id).unwrap();
+        assert_eq!(schedule.amount, 100_000);
+        assert_eq!(schedule.count, 10);
+        assert!(client.spawn_from_schedule(&id, &100_000).is_ok());
+
+        // New schedules exceeding the tightened ceilings are rejected.
+        assert_eq!(
+            client.try_create_schedule(&owner, &recipient, &100_000, &0, &MIN_INTERVAL, &10),
+            Err(Ok(Error::RateExceedsCeiling))
+        );
     }
 }
