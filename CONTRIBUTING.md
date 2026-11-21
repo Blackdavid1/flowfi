@@ -39,6 +39,7 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Project Overview](#project-overview)
 - [Local Development Setup](#local-development-setup)
 - [Accessibility: Motion & Contrast](#accessibility-motion--contrast)
+- [Mobile Wallet Deep-Link Signer Adapter](#mobile-wallet-deep-link-signer-adapter)
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
@@ -323,81 +324,131 @@ note the results in the PR description:
    new value/state is still announced.
 3. **High contrast** — Toggle high-contrast mode and confirm text, status indicators,
    and chart elements remain distinguishable and meet the contrast ratios above.
-4. **Screen reader** — With a screen reader (VoiceOver/NVDA), confirm live balance and
-   transaction status changes are announced via `aria-live` regions and that status is
-   not conveyed by color alone.
 
 ---
 
-## CI/CD Workflows
+## Mobile Wallet Deep-Link Signer Adapter
 
-This repository uses GitHub Actions for continuous integration. Workflows are located in `.github/workflows/`.
+FlowFi supports handing a prepared transaction off to a mobile wallet app via a
+deep link. The adapter is a **signer handoff only**: the application and backend
+never receive, store, or transmit secret keys or signed secret material. The wallet
+holds the keys and returns only the signed transaction envelope (or an error).
 
-### Available Workflows
+### Adapter contract
 
-- **Security Checks** (`.github/workflows/security.yml`)
-  - Runs on: push to `main`/`develop`, pull requests, and weekly schedule
-  - Performs:
-    - Dependency vulnerability scanning (`npm audit`)
-    - CodeQL analysis for JavaScript/TypeScript
-  - View workflow: [Security Checks](.github/workflows/security.yml)
+Any mobile wallet integration must implement the deep-link signer adapter interface
+(`MobileWalletSignerAdapter`). The adapter is responsible for:
 
-- **CI** (`.github/workflows/ci.yml`)
-  - Runs on: push to `main`/`develop` and pull requests
-  - Performs:
-    - Frontend: lint and build
-    - Backend: prisma generation, build, and tests
-    - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
-    - Soroban Contracts: build (wasm) and tests
-  - View workflow: [CI](.github/workflows/ci.yml)
+- Building the outbound deep link from a prepared, unsigned transaction XDR plus the
+  expected network passphrase.
+- Opening the wallet (or returning the deep link for the caller to open).
+- Validating the return link before the signed envelope is accepted.
+- Reporting cancellation distinctly from failure.
 
-### Running CI Checks Locally
+### Supported wallet capabilities
 
-Before pushing, ensure your changes pass all the same checks that run in GitHub Actions.
+Document the capabilities of each supported wallet when adding it. At minimum record:
 
-#### 1. Frontend Checks
-```bash
-cd frontend
-npm run lint    # Runs ESLint
-npm run build   # Verifies the build
-```
+| Capability | Requirement |
+| --- | --- |
+| Sign transaction | Required — returns signed envelope XDR |
+| Network passphrase echo | Required — response must include the network it signed for |
+| Cancellation signal | Required — user rejection must be distinguishable from error |
+| Return-link scheme | Required — must match the registered callback scheme |
+| Multi-op / fee-bump | Optional — note explicitly if unsupported |
 
-#### 2. Backend Checks
-```bash
-cd backend
-npm run prisma:generate  # Ensure Prisma client is up to date
-npm run build           # Verifies TypeScript compilation
-npm run test            # Runs backend vitest suite
-```
-*Note: Backend tests require a running PostgreSQL instance and `DATABASE_URL` environment variable.*
+### Cancellation
 
-#### 3. Smart Contract Checks
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release  # Verifies contract build
-cargo test                                            # Runs contract tests
-```
+- A user rejecting the request in the wallet must surface as a **cancellation**, not
+  a generic error, so the UI can return to an idle state without alarming the user.
+- Cancellation must never be treated as a successful signature.
 
-#### 4. Security Verification
-```bash
-# From the repository root
-npm run verify-security
-```
+### Return-link validation
 
-#### 5. Migration Replay Validation
-```bash
-cd backend
-npm run test:migrations   # replays migrations from the previous supported schema
-```
-*Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
-The same check runs in CI as the `migration-replay` job.*
+- Only accept callbacks whose scheme, host, and path match the registered return link.
+- Reject malformed callbacks (missing/extra fields, unparsable payloads, unexpected
+  query parameters) and untrusted origins. A rejected callback must not be forwarded
+  to the backend or used to build a transaction.
+- Validate the returned envelope is well-formed before submission.
+
+### Network matching
+
+- The network passphrase echoed by the wallet must match the expected network for the
+  prepared transaction. A mismatch must be rejected; never submit a transaction signed
+  for a different network.
+- Chain/network validation must not be weakened to make an integration pass.
+
+### Testing expectations
+
+Add focused automated coverage for the adapter, including at least:
+
+- Successful handoff and return-link validation.
+- Malformed callbacks (bad scheme/host/path, missing fields, unparsable payload).
+- Network mismatch rejection.
+- Cancellation path distinct from failure.
 
 ---
 
-## Database Migrations & Rollout
+## Branching Strategy
 
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every mi
+- `main` — production-ready code
+- `develop` — integration branch
+- `feature/*` — new features
+- `fix/*` — bug fixes
+- `docs/*` — documentation updates
 
-/* … truncated 8348 chars — edit only what you need near the top … */
+Create branches from `develop` and open PRs against `develop` unless instructed otherwise.
+
+---
+
+## Commit Guidelines & Hooks
+
+We use **Conventional Commits**:
+
+```
+<type>(<scope>): <short description>
+```
+
+Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
+
+Examples:
+
+```
+feat(sdk): add secure mobile wallet deep-link signer adapter
+fix(frontend): handle cancelled wallet handoff
+```
+
+Pre-commit hooks run linting and formatting. Do not bypass hooks with `--no-verify`
+unless you have a documented reason.
+
+---
+
+## Pull Request Process
+
+1. Fork the repo and create a branch from `develop`.
+2. Make focused changes — keep the scope limited to the linked issue.
+3. Add or update tests for the changed behavior, including failure and boundary cases.
+4. Update the relevant documentation (API, contract, operational, or contributor docs).
+5. Ensure `npm run lint` and `npm run build` pass for the affected package.
+6. Open a PR with a clear description, the linked issue, and manual verification notes
+   for any critical flow you touched.
+
+Keep existing interfaces compatible unless the change explicitly versions them.
+
+---
+
+## Security
+
+- Never commit secrets, private keys, or credentials.
+- Never expose secret material to the application or backend. Mobile wallet signing
+  happens in the wallet; FlowFi only handles unsigned transactions and signed envelopes.
+- Do not weaken wallet authorization, chain/network validation, financial accounting
+  invariants, or secret-handling requirements to make an implementation pass.
+- Report security issues privately as described in [`SECURITY.md`](../SECURITY.md).
+
+---
+
+## Code of Conduct
+
+Be respectful and constructive. Harassment or abusive behavior is not tolerated.
+See [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) for details.
