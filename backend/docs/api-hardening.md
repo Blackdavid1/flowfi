@@ -1,13 +1,14 @@
 # API Hardening
 
-This document describes the externally observable behavior, migration path, rollout strategy, and operational impact of four API hardening features:
+This document describes the externally observable behavior, migration path, rollout strategy, and operational impact of five API hardening features:
 
 1. Versioned error envelope and stable machine-readable error codes
 2. Principal-aware rate limits for expensive operations
 3. Stable cursor pagination for stream and event history
 4. Idempotency keys for retryable stream commands
+5. Reusable webhook signature verification (SDK helper)
 
-All four features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
+All features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
 
 ---
 
