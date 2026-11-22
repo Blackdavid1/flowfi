@@ -30,7 +30,12 @@ NEXT_PUBLIC_RPC_URL=https://soroban-testnet.stellar.org
 - `npm start`: Runs the production server.
 - `npm run lint`: Runs ESLint to check for code issues.
 
-On an already loaded stream details page, the sender can select Pause while
-offline. The unsigned intent stays in this tab for five minutes. Reconnect
-and choose Review prepared pause to simulate, recheck the indexed stream
-revision and wallet, then request a signature. Reloading discards the intent.
+### Financial view accessibility verification
+
+Enable reduced motion with an active stream open. The balance should update in
+one-second steps without a flash or spinner. Switch the preference while the
+page is open. Enable increased contrast or Windows forced colors and check
+that chart lines and focus outlines remain visible against the canvas.
+Tab through the chart horizon controls and inspect projection days with the
+arrow keys. With a screen reader, verify the selected horizon, date, balance
+and rate, then follow a transaction from signing to its final status by text.
