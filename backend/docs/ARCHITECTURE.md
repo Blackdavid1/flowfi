@@ -204,4 +204,240 @@ rows. Because they run on independent timers, they can race:
 - Both write to the same `Stream` row (upsert), so the last writer wins —
   usually harmless for immutable fields but problematic for additive mutations
   like `withdrawnAmount` (issue #808).
-- `StreamEvent` dedup via `@@unique([tr
+- `StreamEvent` dedup via `@@unique([transactionHash, eventType])` prevents
+  duplicate event rows, but does **not** protect stream state mutations.
+
+**Mitigation:** Do not extend the legacy indexer. The consolidation (issue #801)
+will remove `SorobanIndexerService` entirely.
+
+### Naming Convention Plan
+
+The team convention is kebab-case with a `.service.ts` suffix. Once functional
+consolidation lands:
+
+| Current Name | Expected Future Name |
+|---|---|
+| `indexerService.ts` | `indexer.service.ts` |
+| `soroban-indexer.service.ts` | *(removed)* |
+
+---
+
+## SSE Broadcast Flow
+
+The SSE (Server-Sent Events) subsystem delivers real-time contract event
+notifications to connected frontend clients. The full SSE architecture (scaling,
+memory, security) is documented in
+[`docs/SSE_ARCHITECTURE.md`](./SSE_ARCHITECTURE.md).
+
+### End-to-End Path
+
+```
+Soroban RPC
+    │  SorobanEventWorker polls for new contract events
+    ▼
+SorobanEventWorker (src/workers/soroban-event-worker.ts)
+    │  decode XDR → upsert Stream → insert StreamEvent
+    ▼
+PostgreSQL (via Prisma)
+    │  Stream + StreamEvent rows updated
+    ▼
+SSE broadcast (src/services/sse.service.ts)
+    │  sseService.broadcastToStream(streamId, event, data)
+    │  sseService.broadcastToUser(publicKey, event, data)
+    │  sseService.broadcastToAdmin(event, data)
+    │
+    ├──► [Single instance]  Direct write to in-memory client registry
+    │
+    └──► [Multi-instance]   Redis Pub/Sub
+                             │  publish to sse:stream:<id>, sse:user:<address>
+                             ▼
+                             All backend instances subscribe
+                             │  rebroadcast to local connected clients
+                             ▼
+                         Frontend (useStreamEvents hook)
+```
+
+### Broadcast Channels
+
+The worker uses three broadcast entry points depending on the event:
+
+| Method | When Used | Target Audience |
+|--------|-----------|-----------------|
+| `sseService.broadcastToStream(streamId, event, data)` | Stream lifecycle events (created, topped_up, withdrawn, cancelled, completed, paused, resumed) | Clients subscribed to that specific stream ID or `*` |
+| `sseService.broadcastToUser(publicKey, event, data)` | (Reserved for user-scoped events) | Clients subscribed to `user:<publicKey>` or `*` |
+| `sseService.broadcastToAdmin(event, data)` | Protocol-level events (fee_collected, fee_config_updated, admin_transferred) | The admin user identified by `ADMIN_PUBLIC_KEY` env var |
+
+### Multi-Instance Fanout
+
+When `REDIS_URL` is configured, broadcasts go through Redis Pub/Sub instead of
+direct in-memory writes:
+
+1. The originating instance publishes `{ event, data }` to
+   `sse:stream:<id>` or `sse:user:<address>`.
+2. Every backend instance subscribes via `psubscribe('sse:stream:*',
+   'sse:user:*')` and rebroadcasts to its own local clients.
+3. This means events reach all connected clients regardless of which backend
+   instance they are connected to.
+
+### Client Connection Limits
+
+| Limit | Default | Env Var |
+|-------|---------|---------|
+| Max SSE connections per server | 10,000 | `MAX_SSE_CONNECTIONS` |
+| Max connections per IP | 5 | Hardcoded |
+| Max connections per authenticated user | 10 | Hardcoded |
+
+Slow clients (write buffer ≥ 64 KB) are automatically dropped to protect
+throughput for healthy clients.
+
+---
+
+## Shared Stream Review Links
+
+Stream owners can share a read-only review of a stream via a scoped link. The
+link exposes **only** the fields the owner explicitly selects as public; it never
+reveals wallet addresses, session data, tokens, or secrets.
+
+### Expiry
+
+- Every share link has a TTL. The default is **7 days** and can be configured
+  per link (bounded by a server-side maximum).
+- Expiry is evaluated server-side on every read; an expired link returns a safe
+  `404 Not Found` (identical to an unknown token) so expiry cannot be probed.
+
+### Revocation
+
+- The stream owner can revoke a link at any time before expiry. Revocation is
+  immediate and idempotent.
+- Revoked links return the same safe `404 Not Found` response as expired or
+  unknown links.
+
+### Privacy Boundary
+
+- The shared payload is built from an explicit allow-list of public fields
+  (e.g. stream id, status, amounts, timestamps). Private wallet/session data is
+  never included.
+- The share endpoint is strictly read-only: any mutating method or attempt to
+  access non-public data is rejected with `403 Forbidden`.
+
+---
+
+## Keeper-Key Authorization Model
+
+FlowFi splits transaction signing into two categories: custodial (server-signed)
+and non-custodial (wallet-signed). The signing key determines who is responsible
+for the transaction.
+
+### Action Signing Matrix
+
+| Action | Signer | Mechanism |
+|--------|--------|-----------|
+| **Top-up** | Server (custodial) | Backend submits the transaction using `KEEPER_SECRET_KEY`. The frontend sends only the stream ID and amount. |
+| **Withdraw** | Wallet (non-custodial) | Frontend builds and signs the transaction via the connected wallet (Freighter). The backend simulate endpoint exists for fee estimation only. |
+| **Pause / Resume** | Wallet (non-custodial) | Same as withdraw — frontend-signed. Backend simulate endpoints exist for fee estimation but do not submit. |
+| **Create stream** | Wallet (non-custodial) | Frontend signs via wallet and submits directly to the Soroban RPC. |
+
+### The `KEEPER_SECRET_KEY`
+
+- Stored as an environment variable on the backend.
+- Loaded by `src/services/sorobanService.ts` via
+  `process.env.KEEPER_SECRET_KEY`.
+- Used **exclusively** by the top-up flow. The `topUpStream` function builds
+  the transaction, signs it with the keeper keypair, and submits it to the
+  Soroban RPC.
+- If `KEEPER_SECRET_KEY` is not configured, `topUpStream` throws
+  `'KEEPER_SECRET_KEY not configured'` and the request returns HTTP 500.
+- The cancel endpoint (`src/controllers/stream/cancel.ts`) also reads
+  `KEEPER_SECRET_KEY` but only to check whether the server wallet is configured;
+  the actual cancel transaction is wallet-signed by the sender.
+
+### Security Boundary
+
+> **Do not wire pause/resume/withdraw to a server-side submit path.** Only
+> `top-up` is intentionally custodial. All other mutating actions must be
+> wallet-signed by the user to preserve the non-custodial security model.
+
+The keeper key is a server-side secret and is never exposed to the frontend.
+
+### Cancellation
+
+A handoff can be cancelled by the user (wallet returns `status=cancelled`) or by
+the application (timeout / navigation away). Both paths resolve the pending
+promise with a `DeepLinkCancelledError` and never leave a dangling listener.
+
+### Return-Link Validation
+
+Return callbacks are untrusted input. The adapter rejects a callback when:
+
+- Required fields (`status`, `networkPassphrase`) are missing or malformed.
+- `status` is not one of `signed` / `cancelled` / `rejected`.
+- A `signed` response is missing a well-formed `signedXdr`.
+- The callback origin does not match the configured return origin.
+
+Malformed callbacks surface as `DeepLinkValidationError` and are never treated
+as a successful signature.
+
+### Network Matching
+
+The `networkPassphrase` in the return callback must equal the passphrase the
+request was built for. A mismatch (e.g. mainnet response for a testnet request)
+is rejected with `DeepLinkNetworkMismatchError` before the signed XDR is used.
+This preserves chain/network validation and prevents cross-network replay.
+
+## Verifier-Backed Conditional Release Policies
+
+Some streams gate accrual or release on the result of an external verifier
+(e.g. an oracle, attestation service, or off-chain job runner). This section
+defines the trust model and failure semantics for those streams. The interface
+is additive: streams without a configured verifier keep the existing
+unconditional accrual/release behavior.
+
+### Verifier Identity
+
+- A verifier is identified by a stable `verifierId` (opaque string) plus the
+  on-chain `verifierAddress` that is authorized to submit results. Both are
+  configured at stream creation and are immutable for the life of the stream.
+- Only results whose `verifierAddress` matches the stream's configured address
+  are accepted. Results from any other address are rejected and never mutate
+  stream state.
+- The backend treats the verifier as an **untrusted external input**: it
+  validates identity and shape, but does not assume the verifier is honest or
+  available.
+
+### Trust Assumptions
+
+> **The verifier is trusted only to report its own result — not to move funds,
+> change stream parameters, or bypass wallet authorization.** Release still
+> requires the normal wallet-signed withdraw path; the verifier result only
+> determines *whether* accrual/release is permitted, never *who* may trigger it.
+
+- Verifier results are advisory gates. They cannot weaken wallet authorization,
+  chain/network validation, or financial accounting invariants.
+- The verifier's correctness (e.g. whether a job truly succeeded) is outside the
+  protocol's trust boundary; the protocol only enforces that a result came from
+  the configured verifier and was well-formed.
+
+### Timeout, Failure, and Replay Semantics
+
+| Condition | Behavior |
+|-----------|----------|
+| **No result yet** | Stream accrues/releases per its default policy until a valid result arrives. |
+| **Timeout** | If no valid result arrives within the configured `verifierTimeoutSeconds`, the stream falls back to its configured failure mode (see below). |
+| **Verifier unavailable** | Treated as a timeout once the deadline passes; the failure mode applies. |
+| **Malformed response** | Rejected without mutating state; the stream remains in its pre-result state and the timeout clock continues. |
+| **Wrong verifier identity** | Rejected without mutating state (same as malformed). |
+| **Replay / duplicate result** | Results are keyed by `(streamId, verifierId, nonce)`. A result whose nonce was already consumed is ignored; it never re-triggers release. |
+
+**Failure modes** (configured per stream):
+
+- `block` — accrual/release is blocked until a valid result arrives (default).
+- `release` — accrual/release proceeds as if the verifier returned success.
+
+### Operational Notes
+
+- Malformed or unavailable verifier responses are logged with the stream ID and
+  verifier ID but never surface raw verifier payloads to clients.
+- The timeout boundary is inclusive of the deadline: a result arriving exactly at
+  `verifierTimeoutSeconds` is accepted; anything later is treated as a timeout.
+- Replay protection relies on the consumed-nonce set; operators must not reuse
+  nonces when re-submitting results.

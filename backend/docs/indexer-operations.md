@@ -3,10 +3,10 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the ledger-consistent snapshot
+endpoint, and the indexer metrics. It is written for operators and on-call
+engineers. All public interfaces described here are additive; existing
+endpoints and configuration keys keep working unless noted.
 
 ---
 
@@ -172,80 +172,107 @@ backend instances**.
 
 ---
 
-## 4. Incident evidence and post-incident review
+## 4. Ledger-consistent multi-resource snapshots
 
-Use this template to record impact, timeline, chain state, recovery steps, and
-follow-up work after a production incident. Keep it factual and minimal: record
-**roles and system identifiers**, not personal data (no names, emails, IPs, or
-wallet addresses beyond what is strictly required to describe impact).
+### Contract
 
-### 4.1 Incident summary
+The snapshot endpoint returns related **stream**, **event**, and **balance**
+data tied to a single indexed ledger checkpoint, so clients never have to
+stitch together results read at different ledger heights.
 
-| Field | Value |
+- **Single checkpoint.** All resources in a response are read at the same
+  indexed ledger. The response echoes that ledger as `ledger`.
+- **Staleness metadata.** The response includes `indexerLag` (current chain
+  head minus the snapshot ledger) and `stale` (whether the snapshot is older
+  than the configured freshness threshold).
+- **No checkpoint yet.** If the indexer has not yet indexed any ledger, the
+  endpoint returns a `409`-style "no checkpoint" result rather than an empty
+  snapshot; clients should retry after the indexer catches up.
+
+### Response fields
+
+| Field | Description |
 | --- | --- |
-| Incident ID | |
-| Severity | SEV1 / SEV2 / SEV3 |
-| Status | ongoing / mitigated / resolved |
-| Detected at (UTC) | |
-| Resolved at (UTC) | |
-| Incident commander (role) | |
-| Responders (roles) | |
-| Affected components | indexer / API / DB / RPC / other |
+| `ledger` | The indexed ledger checkpoint the snapshot was read at |
+| `indexerLag` | Ledgers between the chain head and `ledger` (0 when caught up) |
+| `stale` | `true` when `indexerLag` exceeds the freshness threshold |
+| `streams` | Stream records as of `ledger` |
+| `events` | Event records as of `ledger` |
+| `balances` | Balance records as of `ledger` |
 
-### 4.2 Impact
+### Client retry semantics
 
-- **User-visible impact:** what was degraded or unavailable, and for how long.
-- **Scope:** affected networks/environments and ledger range (if known).
-- **Data integrity:** any suspected cursor regression, skipped ledgers, or
-  duplicate events. State explicitly if none observed.
-- **Financial invariants:** confirm whether stream balances/accounting were
-  affected. Do not include amounts tied to identifiable parties.
+When the indexer is lagging, clients **must retry** rather than combine
+results from different ledgers:
 
-### 4.3 Timeline (UTC)
+- If `stale` is `true`, treat the snapshot as advisory and retry with backoff
+  until a fresher snapshot is available; do **not** merge it with data from
+  another request.
+- If the endpoint reports no checkpoint yet, retry after a short delay.
+- A snapshot is internally consistent by construction; combining resources
+  across two snapshot responses read at different `ledger` values is not
+  supported and can produce inconsistent views.
 
-| Time | Event | Evidence link |
+### Boundary cases
+
+- **Zero lag:** `indexerLag` is `0` and `stale` is `false` when the indexer is
+  caught up to the chain head.
+- **Large lag:** `indexerLag` grows with the gap; `stale` flips to `true` once
+  the threshold is exceeded.
+- **No checkpoint:** the endpoint signals retry instead of returning partial
+  data.
+
+---
+
+## 5. Soroban RPC retry and backoff
+
+### Behavior
+
+Soroban RPC calls are retried with bounded exponential backoff and jitter.
+
+- **Retryable errors.** Transient transport failures, timeouts, and rate-limit
+  responses are retried. Deterministic errors (invalid arguments, not found)
+  are not retried.
+- **Bounded attempts.** Each call has a maximum attempt count and a cap on the
+  backoff delay; jitter avoids synchronized retry storms across replicas.
+- **Cursor safety.** A failed poll does not advance the cursor; the next poll
+  resumes from the last successfully applied ledger.
+
+### Configuration
+
+| Key | Meaning | Notes |
 | --- | --- | --- |
-| | Detection (alert / report) | |
-| | Triage started | |
-| | Mitigation applied | |
-| | Recovery verified | |
-| | Incident closed | |
+| `SOROBAN_RPC_MAX_ATTEMPTS` | Maximum attempts per call | Includes the first attempt |
+| `SOROBAN_RPC_BASE_BACKOFF_MS` | Base backoff delay | Grows exponentially per attempt |
+| `SOROBAN_RPC_MAX_BACKOFF_MS` | Backoff cap | Upper bound after jitter |
 
-Link to dashboards, logs, and traces rather than pasting raw payloads. Redact
-secrets and personal data from any attached evidence.
+---
 
-### 4.4 Chain state
+## 6. Graceful shutdown and poll cancellation
 
-| Field | Value |
+### Behavior
+
+On shutdown the indexer stops accepting new work, cancels any in-flight poll,
+and releases the lease so another replica can take over promptly.
+
+- **Cancellation.** An in-flight poll observes the shutdown signal and aborts
+  before advancing the cursor; partially applied work is not committed.
+- **Lease release.** The lease is released on shutdown so takeover latency is
+  not bounded by the TTL.
+- **Idempotent restart.** Because the cursor only advances on committed work,
+  a restart resumes from the last applied ledger without duplication.
+
+---
+
+## 7. Metrics
+
+| Metric | Meaning |
 | --- | --- |
-| Network | |
-| Live cursor at detection | |
-| Live cursor at recovery | |
-| Lease owner / fencing token | |
-| Replay or reset performed | yes / no (requestId) |
-| RPC endpoint health | |
-
-### 4.5 Recovery steps
-
-1. Describe each action taken, in order, with the role that performed it.
-2. Note the verification performed after each step (e.g., cursor advanced,
-   metrics returned to baseline, replay report `status: succeeded`).
-3. Reference the relevant runbook section instead of duplicating procedures.
-
-### 4.6 Follow-up work
-
-| Action | Owner (role) | Verification criteria | Due |
-| --- | --- | --- | --- |
-| | | | |
-
-Each follow-up must have a single owning role and an objective, checkable
-verification criterion (e.g., "alert fires in staging within 5 min of induced
-lease loss").
-
-### 4.7 Related runbooks
-
-- Lease, replay, and cursor procedures: this document (sections 1–3).
-- Observability, metrics, and alerting: see the observability documentation
-  referenced from the operations index.
-- Architecture and event ordering: `backend/docs/ARCHITECTURE.md` and
-  `backend/docs/EVENT_ORDERING.md`.
+| `indexer_lease_acquired_total` | Successful lease acquisitions |
+| `indexer_lease_renewed_total` | Successful lease renewals |
+| `indexer_lease_lost_total` | Lease losses (expiry or renewal failure) |
+| `indexer_fenced_write_rejected_total` | Cursor writes rejected by fencing |
+| `indexer_poll_duration_ms` | Poll duration histogram |
+| `indexer_cursor_ledger` | Current indexed ledger |
+| `indexer_lag_ledgers` | Chain head minus indexed ledger |
+| `indexer_snapshot_stale_total` | Snapshots served while stale |
