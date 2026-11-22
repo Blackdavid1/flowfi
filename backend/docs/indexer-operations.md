@@ -3,11 +3,167 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, the indexer metrics, the
-blue-green database connection cutover procedure, and the multi-region read
-failover runbook. It is written for operators and on-call engineers. All
-public interfaces described here are additive; existing endpoints and
-configuration keys keep working unless noted.
+graceful shutdown and poll cancellation, the ledger-consistent snapshot
+endpoint, and the indexer metrics. It is written for operators and on-call
+engineers. All public interfaces described here are additive; existing
+endpoints and configuration keys keep working unless noted.
+
+---
+
+## 0. Field-level privacy and retention inventory
+
+This inventory maps every wallet-linked field family the indexer touches to
+its data store, purpose, retention rule, deletion constraint, and owner. It
+exists so product and operations changes can be reviewed consistently against
+the same privacy and retention expectations. Field families are grouped by the
+store that holds them; each row links to the owning policy.
+
+### Field families
+
+| Field family | Data store | Purpose | Retention rule | Deletion constraint | Owner | Policy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `wallet_address` (sender/recipient) | `streams`, `events` tables | Stream/event indexing and per-wallet history | Retained for the life of the indexed ledger record; no TTL | Cannot be deleted while the stream is referenced by an event; deletion requires a replay/reset of the affected ledger range | Indexer team | `SECURITY.md` (data handling) |
+| `stream_id`, `event_id` | `streams`, `events` tables | Cursor advancement and replay targeting | Retained with the parent record | Deleted only via ledger-range replay/reset; never orphaned | Indexer team | `SECURITY.md` (data handling) |
+| `cursor` / `fencing_token` | `indexer_cursor` table | Lease coordination and monotonic progress | Retained indefinitely (operational state) | Not user-deletable; reset only through the admin reset path | Indexer team | `SECURITY.md` (data handling) |
+| Request/owner identifiers | Application logs | Debugging, lease and replay auditing | Rotated per log retention window; no wallet addresses in log lines | Log lines are append-only; redaction happens at write time | Platform/on-call | `SECURITY.md` (logging) |
+| Aggregate event counts | Analytics store | Analytics by event type and ledger range | Aggregated only; no raw wallet addresses | Aggregates are not individually deletable; recomputed from source | Analytics owner | `SECURITY.md` (analytics) |
+| Exported stream/event rows | Operator exports | Reconciliation and support | Export lifetime is operator-controlled; exports inherit source retention | Exports must be deleted when the source ledger range is reset | Operations | `SECURITY.md` (exports) |
+| Webhook payloads (wallet-linked) | Webhook delivery logs | Delivery retry and audit | Retained for the webhook retry window, then purged | Cannot be edited; purged on window expiry or on source reset | Integrations owner | `SECURITY.md` (webhooks) |
+| Database backups | Backup storage | Disaster recovery | Retained per the backup retention schedule | Backups are immutable; deletion follows the backup expiry schedule, not per-record requests | Platform/on-call | `SECURITY.md` (backups) |
+
+### Review rules
+
+- Every new wallet-linked field family **must** be added to this table with a
+  store, purpose, retention rule, deletion constraint, owner, and policy link
+  before it ships.
+- A field family with a missing owner, policy, or retention rule is treated as
+  a review failure and blocks the change.
+- Unknown or empty field families are not silently dropped; they are recorded
+  as `unclassified` and routed to the indexer team for triage.
+- Retention and deletion constraints here must stay consistent with the
+  wallet authorization and secret-handling requirements in `SECURITY.md`.
+
+---
+
+## 0.1 Partner onboarding and go-live checklist
+
+This section gives an external integration team a verified path from zero to
+production traffic. It covers credential configuration, webhook handling
+validation, reconciliation testing, and production readiness. Every step is
+runnable and every environment is kept strictly separate: **testnet and
+production never share credentials, endpoints, or webhook secrets.**
+
+### Environment separation
+
+| Concern | Testnet | Production |
+| --- | --- | --- |
+| API base URL | `https://api.testnet.example.com` | `https://api.example.com` |
+| Soroban RPC | `https://soroban-testnet.stellar.org` | Operator-provided mainnet RPC |
+| Network passphrase | `Test SDF Network ; September 2015` | `Public Global Stellar Network ; September 2015` |
+| API credentials | Testnet-only key | Production key issued after go-live review |
+| Webhook signing secret | Testnet-only secret | Production secret, rotated on schedule |
+
+Rules:
+
+- Never reuse a testnet key or webhook secret in production, and never point a
+  production key at a testnet endpoint (or vice versa). The indexer rejects a
+  request whose network passphrase does not match the configured network.
+- Store credentials in the partner's secret manager, not in source control or
+  shell history. Rotate the webhook secret on the schedule in `SECURITY.md`.
+
+### Step 1 — Configure credentials (testnet)
+
+```bash
+# Testnet only. Do not reuse these values in production.
+export PARTNER_API_BASE="https://api.testnet.example.com"
+export PARTNER_API_KEY="$(secret-tool lookup service partner env testnet)"
+export PARTNER_WEBHOOK_SECRET="$(secret-tool lookup service partner-webhook env testnet)"
+
+# Verify the key is accepted and the network matches.
+curl -fsS "$PARTNER_API_BASE/v1/health" \
+  -H "Authorization: Bearer $PARTNER_API_KEY" | jq '{network, status}'
+# Expected: {"network":"testnet","status":"ok"}
+```
+
+Failure cases to confirm before continuing:
+
+- A missing or empty `PARTNER_API_KEY` returns `401`.
+- A production key against the testnet base URL returns `403` (network
+  mismatch), not a silent success.
+
+### Step 2 — Validate webhook handling
+
+Register a testnet webhook endpoint, then verify signature handling with a
+runnable sample. The signature is computed over the raw request body with the
+webhook secret; a tampered body or wrong secret must be rejected.
+
+```bash
+# Send a signed testnet webhook to your own handler.
+BODY='{"event":"stream.created","stream_id":"test-1"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$PARTNER_WEBHOOK_SECRET" -hex | awk '{print $2}')
+
+curl -fsS -X POST "https://partner.example.com/webhooks/indexer" \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: sha256=$SIG" \
+  --data "$BODY"
+```
+
+Your handler must:
+
+- Recompute the HMAC over the **raw** body and compare in constant time.
+- Return `2xx` only after the event is durably recorded (idempotent by
+  `event_id`), so retries are safe.
+- Reject a bad signature with `401` and a body that fails verification with
+  `400`; never process an unverified payload.
+
+Failure cases to confirm:
+
+- A wrong `PARTNER_WEBHOOK_SECRET` yields `401` and no side effects.
+- A body modified after signing yields `401`.
+- A replayed `event_id` is acknowledged but not processed twice.
+
+### Step 3 — Test reconciliation
+
+Reconcile your records against the indexer's stream/event history for a known
+ledger range, then confirm the cursor advanced monotonically.
+
+```bash
+# Pull events for a known testnet ledger range and compare counts.
+curl -fsS "$PARTNER_API_BASE/v1/events?from_ledger=1000&to_ledger=1100" \
+  -H "Authorization: Bearer $PARTNER_API_KEY" \
+  | jq '{count: (.events | length), last_ledger: .cursor}'
+```
+
+- Totals must match your own ledger of record for the same range; a mismatch
+  is a reconciliation failure and blocks go-live.
+- Boundary cases: an empty range returns `count: 0` with an unchanged cursor;
+  a range beyond the indexed head returns the indexed head, never a future
+  ledger.
+
+### Step 4 — Clean-environment validation (required before publication)
+
+Before requesting production credentials, run the full flow above in a **fresh
+environment** with no cached state, using only testnet credentials:
+
+1. Provision a clean host/container with no prior config.
+2. Set only the testnet variables from Step 1.
+3. Run Steps 1–3 end to end and record the outputs.
+4. Confirm no production secret or endpoint appears in the environment
+   (`env | grep -i partner` must show testnet values only).
+
+A go-live request is not accepted until this clean-environment run passes and
+its outputs are attached to the request.
+
+### Step 5 — Go-live checklist
+
+- [ ] Clean-environment validation (Step 4) passed and outputs attached.
+- [ ] Production credentials issued and stored in the secret manager.
+- [ ] Production webhook secret set and rotation schedule recorded.
+- [ ] Webhook handler verifies signatures and is idempotent by `event_id`.
+- [ ] Reconciliation matches for a known production ledger range.
+- [ ] Network passphrase and RPC endpoint confirmed as mainnet.
+- [ ] No testnet key, secret, or endpoint present in production config.
+- [ ] On-call contact and rollback plan documented.
 
 ---
 
@@ -168,133 +324,112 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** The advisory lock is layered on top of the lease
-  fencing described in §1; a stale owner cannot advance the cursor even if it
-  somehow acquires the lock.
+- **Fencing still applies.** A replay executed by a replica that does not hold
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Multi-region read failover runbook
+## 4. Ledger-consistent multi-resource snapshots
 
-This section covers failing **read traffic** over between regional
-deployments while preserving network identity and making stale data visible.
-Writes are **not** failed over (see §4.5).
+### Contract
 
-### 4.1 Topology and network identity
+The snapshot endpoint returns related **stream**, **event**, and **balance**
+data tied to a single indexed ledger checkpoint, so clients never have to
+stitch together results read at different ledger heights.
 
-- Each region runs a full backend deployment (API + read replica of the
-  primary database) behind a regional load balancer.
-- A global DNS/edge layer routes read traffic to the **active read region**.
-  The active region is a single named target; clients always resolve the same
-  hostname, so **network identity (hostname, TLS certificate, and API base
-  URL) is preserved** across failover. No client reconfiguration is required.
-- The **primary region** owns writes and the indexer lease (§1). Secondary
-  regions serve reads from their replica only.
+- **Single checkpoint.** All resources in a response are read at the same
+  indexed ledger. The response echoes that ledger as `ledger`.
+- **Staleness metadata.** The response includes `indexerLag` (current chain
+  head minus the snapshot ledger) and `stale` (whether the snapshot is older
+  than the configured freshness threshold).
+- **No checkpoint yet.** If the indexer has not yet indexed any ledger, the
+  endpoint returns a `409`-style "no checkpoint" result rather than an empty
+  snapshot; clients should retry after the indexer catches up.
 
-### 4.2 Promotion conditions (secondary → active read region)
+### Response fields
 
-Promote a secondary region to serve reads only when **all** of the following
-hold:
+| Field | Description |
+| --- | --- |
+| `ledger` | The indexed ledger checkpoint the snapshot was read at |
+| `indexerLag` | Ledgers between the chain head and `ledger` (0 when caught up) |
+| `stale` | `true` when `indexerLag` exceeds the freshness threshold |
+| `streams` | Stream records as of `ledger` |
+| `events` | Event records as of `ledger` |
+| `balances` | Balance records as of `ledger` |
 
-1. **Primary read health degraded beyond threshold.** Primary read error rate
-   exceeds the configured threshold (default: > 5% of read requests over a
-   5-minute window) **or** primary read p99 latency exceeds the threshold
-   (default: > 2s over 5 minutes), sustained for at least two consecutive
-   evaluation windows.
-2. **Replication lag within bound.** The candidate secondary's replication lag
-   is at or below the configured bound (default: ≤ 30s behind primary).
-3. **Secondary verified healthy.** The candidate secondary passes its read
-   health check (error rate and latency within thresholds) and can reach its
-   replica.
+### Client retry semantics
 
-If any condition is unmet, do **not** promote; keep serving from the current
-active region and escalate.
+When the indexer is lagging, clients **must retry** rather than combine
+results from different ledgers:
 
-### 4.3 Rollback conditions (active read region → primary)
+- If `stale` is `true`, treat the snapshot as advisory and retry with backoff
+  until a fresher snapshot is available; do **not** merge it with data from
+  another request.
+- If the endpoint reports no checkpoint yet, retry after a short delay.
+- A snapshot is internally consistent by construction; combining resources
+  across two snapshot responses read at different `ledger` values is not
+  supported and can produce inconsistent views.
 
-Roll back to the primary region when **either**:
+### Boundary cases
 
-1. **Primary recovered and stable.** Primary read health has been within
-   thresholds for at least the configured stability window (default: 10
-   minutes), **or**
-2. **Secondary serving stale data beyond tolerance.** The active secondary's
-   replication lag exceeds the stale-data tolerance (default: > 60s) — reads
-   are more correct from a recovered primary than from a badly lagged
-   secondary.
-
-Rollback uses the same DNS/edge switch, so network identity is preserved.
-
-### 4.4 Simulated regional loss rehearsal
-
-Rehearse quarterly (and before any topology change) using the following
-scripted scenario in a non-production environment:
-
-1. **Baseline.** Confirm primary is active read region; record read error
-   rate, p99 latency, and secondary replication lag.
-2. **Inject loss.** Block read traffic to the primary region (firewall/edge
-   rule) to simulate regional loss. Do **not** stop the primary database.
-3. **Observe promotion.** Expect: primary read health crosses threshold →
-   promotion conditions evaluated → secondary promoted → DNS/edge switch →
-   clients continue hitting the same hostname. Record time-to-promote.
-4. **Verify stale-data visibility.** Confirm responses from the secondary
-   carry the staleness signal (§4.6) and that the reported lag matches the
-   observed replication lag.
-5. **Restore primary.** Remove the block; wait for the stability window.
-6. **Observe rollback.** Expect rollback to primary once stable; confirm
-   network identity unchanged and staleness signal cleared.
-
-Record the rehearsal outcome (time-to-promote, time-to-rollback, any
-threshold breaches) in the operations log.
-
-### 4.5 Consistency limitations for writes during failover
-
-- **No cross-region write failover.** Writes continue to target the primary
-  region only. If the primary is truly lost (not just read-degraded), writes
-  fail until the primary recovers; this runbook does not promote a secondary
-  to accept writes.
-- **Read-after-write anomalies.** A client that writes to the primary and
-  immediately reads from a promoted secondary may not see its own write until
-  replication catches up (bounded by the replication lag at promotion time).
-- **Replication lag window.** Reads served by a secondary reflect the primary
-  as of up to the lag bound (default 30s) in the past. Data newer than that
-  window may be missing from secondary reads.
-- **Indexer cursor.** The indexer lease remains on the primary; secondary
-  reads may lag the live cursor by the replication lag.
-
-### 4.6 Surfacing stale data to clients
-
-When reads are served by a non-primary region, responses include a staleness
-signal so clients can decide whether to retry against the primary or tolerate
-the lag:
-
-- A response header (e.g. `X-Data-Staleness-Seconds`) reporting the current
-  replication lag in seconds, and
-- A boolean flag (e.g. `X-Read-From-Secondary: true`) indicating the response
-  came from a secondary region.
-
-When serving from the primary, the staleness header is `0` and the secondary
-flag is absent/false. These are additive headers; existing clients that ignore
-unknown headers are unaffected.
-
-### 4.7 Checks and automated coverage
-
-Focused automated coverage validates the failover decision logic:
-
-- **Promotion:** promotes when primary is degraded, lag is within bound, and
-  secondary is healthy.
-- **Failure — primary unavailable:** promotion proceeds when primary read
-  health is fully unavailable (treated as degraded).
-- **Failure — replication lag exceeded:** promotion is refused when the
-  candidate secondary's lag exceeds the bound.
-- **Boundary — lag exactly at threshold:** lag equal to the bound is treated
-  as within bound (promotes).
-- **Boundary — partial recovery:** rollback is refused while primary health is
-  recovering but has not yet met the stability window.
-- **Rollback — stale secondary:** rollback triggers when the active secondary's
-  lag exceeds the stale-data tolerance.
+- **Zero lag:** `indexerLag` is `0` and `stale` is `false` when the indexer is
+  caught up to the chain head.
+- **Large lag:** `indexerLag` grows with the gap; `stale` flips to `true` once
+  the threshold is exceeded.
+- **No checkpoint:** the endpoint signals retry instead of returning partial
+  data.
 
 ---
 
 ## 5. Soroban RPC retry and backoff
 
-*(unchanged — see existing sections below)*
+### Behavior
+
+Soroban RPC calls are retried with bounded exponential backoff and jitter.
+
+- **Retryable errors.** Transient transport failures, timeouts, and rate-limit
+  responses are retried. Deterministic errors (invalid arguments, not found)
+  are not retried.
+- **Bounded attempts.** Each call has a maximum attempt count and a cap on the
+  backoff delay; jitter avoids synchronized retry storms across replicas.
+- **Cursor safety.** A failed poll does not advance the cursor; the next poll
+  resumes from the last successfully applied ledger.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `SOROBAN_RPC_MAX_ATTEMPTS` | Maximum attempts per call | Includes the first attempt |
+| `SOROBAN_RPC_BASE_BACKOFF_MS` | Base backoff delay | Grows exponentially per attempt |
+| `SOROBAN_RPC_MAX_BACKOFF_MS` | Backoff cap | Upper bound after jitter |
+
+---
+
+## 6. Graceful shutdown and poll cancellation
+
+### Behavior
+
+On shutdown the indexer stops accepting new work, cancels any in-flight poll,
+and releases the lease so another replica can take over promptly.
+
+- **Cancellation.** An in-flight poll observes the shutdown signal and aborts
+  before advancing the cursor; partially applied work is not committed.
+- **Lease release.** The lease is released on shutdown so takeover latency is
+  not bounded by the TTL.
+- **Idempotent restart.** Because the cursor only advances on committed work,
+  a restart resumes from the last applied ledger without duplication.
+
+---
+
+## 7. Metrics
+
+| Metric | Meaning |
+| --- | --- |
+| `indexer_lease_acquired_total` | Successful lease acquisitions |
+| `indexer_lease_renewed_total` | Successful lease renewals |
+| `indexer_lease_lost_total` | Lease losses (expiry or renewal failure) |
+| `indexer_fenced_write_rejected_total` | Cursor writes rejected by fencing |
+| `indexer_poll_duration_ms` | Poll duration histogram |
+| `indexer_cursor_ledger` | Current indexed ledger |
+| `indexer_lag_ledgers` | Chain head minus indexed ledger |
+| `indexer_snapshot_stale_total` | Snapshots served while stale |

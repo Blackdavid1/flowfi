@@ -1,75 +1,32 @@
 # Contributing
 
-Thanks for helping improve this project. This guide covers local setup, the
-pull-request workflow, and the environment policy that CI enforces on every PR.
+Thanks for your interest in contributing. This document covers the basics.
 
 ## Getting started
 
 1. Fork the repository and create a topic branch from `main`.
-2. Install dependencies for the package you are changing (see each package's
-   `README.md`).
-3. Make focused changes with tests, then open a pull request.
+2. Make focused changes that address a single issue.
+3. Open a pull request describing the change and linking the issue.
 
-## Pull-request workflow
+## Code style
 
-- Keep each PR scoped to a single capability or fix.
-- Include automated coverage for new behavior, including failure and boundary
-  cases.
-- Update the owning documentation (API, contract, operational, or contributor)
-  alongside code changes.
-- Keep existing interfaces compatible unless the change explicitly versions
-  them.
+- Match the existing patterns, naming, and module structure of the files you touch.
+- Keep changes surgical; avoid unrelated refactors or formatting churn.
+- Do not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements.
 
-## Environment policy validation
+## Tests
 
-Every pull request runs an environment policy check before preview or
-production deployment workflows are allowed to run or publish. The check
-validates the workflow configuration against the approved policy for:
+- Add focused automated coverage for changed behavior, including failure and boundary cases.
+- Do not commit secrets, tokens, or credentials.
 
-- **Networks** — only approved chain/network identifiers may be referenced by
-  preview and deployment workflows.
-- **Domains** — preview and deployment hosts must match the approved domain
-  allowlist.
-- **Secrets** — workflows may only reference approved secret names, and secret
-  values must never be printed, echoed, or committed.
+## Verifier-backed conditional release policies
 
-### Accepted vs. rejected configurations
+Streams may make accrual or release conditional on a configured verifier result. When working on this capability, keep the following explicit in code, tests, and docs:
 
-- **Accepted** fixtures use approved networks, domains, and secret names, and
-  reference secrets only through the secret store (never inline values).
-- **Rejected** fixtures reference an unapproved network, an off-allowlist
-domain, or an unapproved/inline secret. The check fails the PR with an
-  actionable message that names the offending workflow, the policy rule that
-  was violated, and the offending key — but never the secret value itself.
+- **Verifier identity**: record which verifier (address/identifier) is trusted for a stream. Only results from the configured verifier are honored; results from any other source must be rejected.
+- **Trust assumptions**: the protocol trusts the configured verifier to report results honestly and in a timely manner. It does not independently validate the underlying off-chain condition. Document this assumption wherever the policy is configured.
+- **Timeout**: define a bounded timeout for verifier responses. A result arriving after the timeout must not release funds.
+- **Failure mode**: define what happens when the verifier is unavailable, times out, or returns a malformed response. The default must be fail-closed — no release on an unverifiable result.
+- **Replay/nonce semantics**: results must be bound to a stream and a nonce (or equivalent) so a previously accepted result cannot be replayed to trigger additional release. Reject reused or out-of-order results.
 
-### Reporting failures safely
-
-When the policy check fails, it reports:
-
-- the workflow file and job/step that violated the policy,
-- the rule category (network, domain, or secret) and the expected allowlist
-  entry,
-- the offending configuration key.
-
-It must not echo secret values, resolved environment contents, or full
-credential strings. If you believe a failure is a false positive, update the
-approved policy in the same PR with justification rather than weakening the
-check.
-
-### Running the check locally
-
-Run the environment policy validation for your changed workflows before
-pushing. Fix any reported violations; do not bypass or disable the check to
-make a PR pass.
-
-## Secret handling
-
-- Never commit secrets, tokens, or credentials.
-- Reference secrets only by name through the secret manager.
-- Do not weaken wallet authorization, chain/network validation, financial
-  accounting invariants, or secret-handling requirements to make a change
-  pass.
-
-## Code of conduct
-
-Be respectful and constructive in reviews and discussions.
+When adding or changing this behavior, include tests for malformed verifier responses, an unavailable verifier, the timeout boundary, and replay attempts.
