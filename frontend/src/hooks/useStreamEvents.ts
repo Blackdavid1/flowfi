@@ -1,369 +1,324 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 
 /**
- * Stream lifecycle event types that can trigger notifications.
+ * Parsed activity filters used by the transaction activity explorer.
  *
- * Privacy model:
- * - Notification preferences are scoped strictly to the connected wallet's
- *   public key. No personally identifiable information (PII) is collected,
- *   stored, or transmitted.
- * - Preferences are persisted locally (localStorage) and optionally synced to
- *   the backend `NotificationPreference` model keyed by wallet public key.
- * - Users may opt out of any channel/event combination at any time; opt-out is
- *   honored immediately and persisted so it survives reloads and reconnects.
- * - Browser notifications require explicit permission; denial is handled
- *   gracefully and never blocks in-app notifications.
+ * All fields are optional; an empty/undefined value means "no constraint".
+ * The explorer keeps these URL-addressable, so this hook treats them as
+ * plain data and derives a stable query key from them.
  */
-export type StreamEventType =
-  | 'CREATED'
-  | 'TOPPED_UP'
-  | 'WITHDRAWN'
-  | 'CANCELLED'
-  | 'COMPLETED'
-  | 'PAUSED'
-  | 'RESUMED';
-
-export const STREAM_EVENT_TYPES: readonly StreamEventType[] = [
-  'CREATED',
-  'TOPPED_UP',
-  'WITHDRAWN',
-  'CANCELLED',
-  'COMPLETED',
-  'PAUSED',
-  'RESUMED',
-] as const;
-
-export type NotificationChannel = 'inApp' | 'browser';
-
-export interface ChannelPreferences {
-  inApp: boolean;
-  browser: boolean;
+export interface ActivityFilters {
+  /** Lifecycle action types (e.g. "created", "claimed", "cancelled"). */
+  types?: string[];
+  /** Asset identifier (symbol or contract address). */
+  asset?: string;
+  /** Participant address (sender / recipient). */
+  participant?: string;
+  /** Inclusive lower bound of the date range (ISO string). */
+  from?: string;
+  /** Inclusive upper bound of the date range (ISO string). */
+  to?: string;
+  /** Free-text search across event metadata. */
+  search?: string;
+  /** Sort direction for the result set. */
+  sort?: 'asc' | 'desc';
 }
 
-export type NotificationPreferences = Record<StreamEventType, ChannelPreferences>;
-
+/**
+ * A single stream event as returned by the backend events endpoint.
+ * Kept intentionally loose so the explorer can render unknown fields.
+ */
 export interface StreamEvent {
-  eventType: StreamEventType;
-  streamId: string;
-  transactionHash: string;
-  /** Optional ledger/timestamp for ordering; not required for dedupe. */
-  timestamp?: number;
+  id: string;
+  type: string;
+  streamId?: string;
+  asset?: string;
+  sender?: string;
+  recipient?: string;
+  amount?: string;
+  timestamp: string;
+  [key: string]: unknown;
 }
 
-export interface NotificationPreferenceRecord {
-  walletPublicKey: string;
-  preferences: NotificationPreferences;
-  updatedAt: number;
-}
-
-const STORAGE_KEY_PREFIX = 'stream-notification-preferences:';
-const DEDUPE_KEY_PREFIX = 'stream-notification-dedupe:';
-const DEDUPE_MAX_ENTRIES = 500;
-
-export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
-  CREATED: { inApp: true, browser: true },
-  TOPPED_UP: { inApp: true, browser: false },
-  WITHDRAWN: { inApp: true, browser: false },
-  CANCELLED: { inApp: true, browser: true },
-  COMPLETED: { inApp: true, browser: true },
-  PAUSED: { inApp: true, browser: false },
-  RESUMED: { inApp: true, browser: false },
-};
-
-function clonePreferences(prefs: NotificationPreferences): NotificationPreferences {
-  const result = {} as NotificationPreferences;
-  for (const type of STREAM_EVENT_TYPES) {
-    const channel = prefs[type] ?? DEFAULT_NOTIFICATION_PREFERENCES[type];
-    result[type] = { inApp: !!channel.inApp, browser: !!channel.browser };
-  }
-  return result;
-}
-
-function storageKey(walletPublicKey: string): string {
-  return `${STORAGE_KEY_PREFIX}${walletPublicKey}`;
-}
-
-function dedupeKey(walletPublicKey: string): string {
-  return `${DEDUPE_KEY_PREFIX}${walletPublicKey}`;
-}
-
-function safeGetItem(key: string): string | null {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return null;
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function safeSetItem(key: string, value: string): void {
-  try {
-    if (typeof window === 'undefined' || !window.localStorage) return;
-    window.localStorage.setItem(key, value);
-  } catch {
-    // Storage may be unavailable (private mode, quota); preferences still work
-    // for the current session via in-memory state.
-  }
-}
-
-export function loadPreferences(walletPublicKey: string): NotificationPreferences {
-  const raw = safeGetItem(storageKey(walletPublicKey));
-  if (!raw) return clonePreferences(DEFAULT_NOTIFICATION_PREFERENCES);
-  try {
-    const parsed = JSON.parse(raw) as Partial<NotificationPreferences>;
-    return clonePreferences(parsed as NotificationPreferences);
-  } catch {
-    return clonePreferences(DEFAULT_NOTIFICATION_PREFERENCES);
-  }
-}
-
-export function savePreferences(
-  walletPublicKey: string,
-  preferences: NotificationPreferences,
-): void {
-  const record: NotificationPreferenceRecord = {
-    walletPublicKey,
-    preferences: clonePreferences(preferences),
-    updatedAt: Date.now(),
-  };
-  safeSetItem(storageKey(walletPublicKey), JSON.stringify(record.preferences));
-}
-
-function loadDedupeSet(walletPublicKey: string): string[] {
-  const raw = safeGetItem(dedupeKey(walletPublicKey));
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveDedupeSet(walletPublicKey: string, keys: string[]): void {
-  const trimmed = keys.slice(-DEDUPE_MAX_ENTRIES);
-  safeSetItem(dedupeKey(walletPublicKey), JSON.stringify(trimmed));
-}
-
-export function dedupeIdentifier(event: StreamEvent): string {
-  return `${event.transactionHash}:${event.eventType}`;
-}
-
-export function buildStreamDeepLink(streamId: string): string {
-  const encoded = encodeURIComponent(streamId);
-  return `/streams/${encoded}`;
-}
-
-export interface NotificationPermissionState {
-  supported: boolean;
-  permission: NotificationPermission | 'unsupported';
-}
-
-function getPermissionState(): NotificationPermissionState {
-  if (typeof window === 'undefined' || typeof window.Notification === 'undefined') {
-    return { supported: false, permission: 'unsupported' };
-  }
-  return { supported: true, permission: window.Notification.permission };
+export interface StreamEventsPage {
+  events: StreamEvent[];
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 
 export interface UseStreamEventsOptions {
-  walletPublicKey: string | null | undefined;
-  /** Optional backend sync hook. Called after local persistence. */
-  syncPreferences?: (
-    walletPublicKey: string,
-    preferences: NotificationPreferences,
-  ) => Promise<void> | void;
-  /** Optional in-app notification sink. */
-  onInAppNotification?: (event: StreamEvent, deepLink: string) => void;
+  /** Connected wallet address. When absent, no request is made. */
+  walletAddress?: string | null;
+  /** Active network identifier; part of the query key to preserve context. */
+  network?: string | null;
+  /** Parsed activity filters. */
+  filters?: ActivityFilters;
+  /** Opaque pagination cursor from a previous page. */
+  cursor?: string | null;
+  /** Page size. Defaults to the backend default when omitted. */
+  limit?: number;
+  /** Base URL for the backend API. Defaults to a relative path. */
+  baseUrl?: string;
+  /** Disable the query entirely (e.g. while filters are invalid). */
+  enabled?: boolean;
 }
 
 export interface UseStreamEventsResult {
-  preferences: NotificationPreferences;
-  permission: NotificationPermissionState;
-  setChannelEnabled: (
-    eventType: StreamEventType,
-    channel: NotificationChannel,
-    enabled: boolean,
-  ) => void;
-  setAllForChannel: (channel: NotificationChannel, enabled: boolean) => void;
-  requestBrowserPermission: () => Promise<NotificationPermission | 'unsupported'>;
-  handleEvent: (event: StreamEvent) => void;
-  resetPreferences: () => void;
+  events: StreamEvent[];
+  /** Cursor to request the next page, or null when exhausted. */
+  nextCursor: string | null;
+  /** Whether more pages are available. */
+  hasMore: boolean;
+  /** True while a request is in flight (including refetches). */
+  isLoading: boolean;
+  /** True only for the initial load of the current key. */
+  isInitialLoading: boolean;
+  /** True while fetching a subsequent page or refetch. */
+  isFetching: boolean;
+  /** Normalized error, or null. */
+  error: Error | null;
+  /** True when the request succeeded but returned no events. */
+  isEmpty: boolean;
+  /** Manually refetch the current page. */
+  refetch: () => void;
 }
 
-export function useStreamEvents(options: UseStreamEventsOptions): UseStreamEventsResult {
-  const { walletPublicKey, syncPreferences, onInAppNotification } = options;
+const DEFAULT_BASE_URL = '/api';
 
-  const [preferences, setPreferences] = useState<NotificationPreferences>(() =>
-    walletPublicKey
-      ? loadPreferences(walletPublicKey)
-      : clonePreferences(DEFAULT_NOTIFICATION_PREFERENCES),
+/**
+ * Normalize filters into a stable, serializable shape so the query key does
+ * not change identity on every render (e.g. array reordering, undefined vs
+ * empty string).
+ */
+function normalizeFilters(filters?: ActivityFilters): ActivityFilters {
+  if (!filters) return {};
+  const normalized: ActivityFilters = {};
+
+  if (filters.types && filters.types.length > 0) {
+    normalized.types = Array.from(new Set(filters.types)).sort();
+  }
+  if (filters.asset) normalized.asset = filters.asset.trim();
+  if (filters.participant) normalized.participant = filters.participant.trim();
+  if (filters.from) normalized.from = filters.from;
+  if (filters.to) normalized.to = filters.to;
+  if (filters.search) normalized.search = filters.search.trim();
+  if (filters.sort) normalized.sort = filters.sort;
+
+  return normalized;
+}
+
+/**
+ * Build the query string for the backend events endpoint. Empty values are
+ * omitted so the URL stays canonical and cache-friendly.
+ */
+function buildQueryString(
+  filters: ActivityFilters,
+  cursor: string | null | undefined,
+  limit: number | undefined,
+): string {
+  const params = new URLSearchParams();
+
+  if (filters.types && filters.types.length > 0) {
+    params.set('types', filters.types.join(','));
+  }
+  if (filters.asset) params.set('asset', filters.asset);
+  if (filters.participant) params.set('participant', filters.participant);
+  if (filters.from) params.set('from', filters.from);
+  if (filters.to) params.set('to', filters.to);
+  if (filters.search) params.set('search', filters.search);
+  if (filters.sort) params.set('sort', filters.sort);
+  if (cursor) params.set('cursor', cursor);
+  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) {
+    params.set('limit', String(limit));
+  }
+
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
+}
+
+/**
+ * Coerce an unknown backend payload into a StreamEventsPage. Tolerates a few
+ * common response shapes so the explorer stays resilient to contract drift.
+ */
+function parsePage(payload: unknown): StreamEventsPage {
+  if (!payload || typeof payload !== 'object') {
+    return { events: [], nextCursor: null, hasMore: false };
+  }
+
+  const record = payload as Record<string, unknown>;
+  const rawEvents = Array.isArray(record.events)
+    ? record.events
+    : Array.isArray(record.data)
+      ? record.data
+      : Array.isArray(record.items)
+        ? record.items
+        : [];
+
+  const events = rawEvents.filter(
+    (item): item is StreamEvent =>
+      !!item && typeof item === 'object' && typeof (item as StreamEvent).id === 'string',
   );
-  const [permission, setPermission] = useState<NotificationPermissionState>(() =>
-    getPermissionState(),
-  );
 
-  const walletRef = useRef<string | null>(walletPublicKey ?? null);
-  const onInAppRef = useRef(onInAppNotification);
-  onInAppRef.current = onInAppNotification;
-  const syncRef = useRef(syncPreferences);
-  syncRef.current = syncPreferences;
+  const nextCursor =
+    typeof record.nextCursor === 'string'
+      ? record.nextCursor
+      : typeof record.next_cursor === 'string'
+        ? record.next_cursor
+        : null;
 
-  // Reload preferences whenever the wallet changes so preferences are strictly
-  // wallet-scoped and never leak between accounts.
-  useEffect(() => {
-    walletRef.current = walletPublicKey ?? null;
-    if (walletPublicKey) {
-      setPreferences(loadPreferences(walletPublicKey));
-    } else {
-      setPreferences(clonePreferences(DEFAULT_NOTIFICATION_PREFERENCES));
-    }
-    setPermission(getPermissionState());
-  }, [walletPublicKey]);
+  const hasMore =
+    typeof record.hasMore === 'boolean'
+      ? record.hasMore
+      : typeof record.has_more === 'boolean'
+        ? record.has_more
+        : nextCursor !== null;
 
-  const persist = useCallback((next: NotificationPreferences) => {
-    const wallet = walletRef.current;
-    if (!wallet) return;
-    savePreferences(wallet, next);
-    if (syncRef.current) {
-      try {
-        void syncRef.current(wallet, next);
-      } catch {
-        // Backend sync failures must not break local opt-out semantics.
-      }
-    }
-  }, []);
+  return { events, nextCursor, hasMore };
+}
 
-  const setChannelEnabled = useCallback(
-    (eventType: StreamEventType, channel: NotificationChannel, enabled: boolean) => {
-      setPreferences((prev) => {
-        const next = clonePreferences(prev);
-        next[eventType] = { ...next[eventType], [channel]: enabled };
-        persist(next);
-        return next;
-      });
-    },
-    [persist],
-  );
+async function fetchStreamEvents(
+  url: string,
+  signal: AbortSignal,
+): Promise<StreamEventsPage> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+    signal,
+    credentials: 'same-origin',
+  });
 
-  const setAllForChannel = useCallback(
-    (channel: NotificationChannel, enabled: boolean) => {
-      setPreferences((prev) => {
-        const next = clonePreferences(prev);
-        for (const type of STREAM_EVENT_TYPES) {
-          next[type] = { ...next[type], [channel]: enabled };
-        }
-        persist(next);
-        return next;
-      });
-    },
-    [persist],
-  );
-
-  const requestBrowserPermission = useCallback(async (): Promise<
-    NotificationPermission | 'unsupported'
-  > => {
-    if (typeof window === 'undefined' || typeof window.Notification === 'undefined') {
-      setPermission({ supported: false, permission: 'unsupported' });
-      return 'unsupported';
-    }
+  if (!response.ok) {
+    let message = `Failed to load stream events (${response.status})`;
     try {
-      const result = await window.Notification.requestPermission();
-      setPermission({ supported: true, permission: result });
-      return result;
+      const body = (await response.json()) as { message?: string; error?: string };
+      if (body?.message) message = body.message;
+      else if (body?.error) message = body.error;
     } catch {
-      // Some browsers throw on requestPermission (e.g. insecure context).
-      const state = getPermissionState();
-      setPermission(state);
-      return state.permission;
+      // Ignore body parse failures; keep the status-based message.
     }
-  }, []);
+    const error = new Error(message);
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
+  }
 
-  const handleEvent = useCallback((event: StreamEvent) => {
-    const wallet = walletRef.current;
-    if (!wallet) return;
+  const payload = (await response.json()) as unknown;
+  return parsePage(payload);
+}
 
-    const prefs = loadPreferences(wallet);
-    const channelPrefs = prefs[event.eventType];
-    if (!channelPrefs) return;
+/**
+ * Fetch a paginated page of stream events for the connected wallet.
+ *
+ * - The query key includes the active network so switching networks never
+ *   serves stale events from another chain.
+ * - In-flight requests are cancelled when filters, cursor, wallet, or network
+ *   change (via AbortSignal wired through react-query).
+ * - Exposes loading / error / empty states plus `nextCursor` / `hasMore` so
+ *   the explorer can paginate stably.
+ */
+export function useStreamEvents(
+  options: UseStreamEventsOptions = {},
+): UseStreamEventsResult {
+  const {
+    walletAddress,
+    network,
+    filters,
+    cursor,
+    limit,
+    baseUrl = DEFAULT_BASE_URL,
+    enabled = true,
+  } = options;
 
-    const identifier = dedupeIdentifier(event);
-    const seen = loadDedupeSet(wallet);
-    if (seen.includes(identifier)) {
-      // Duplicate event (same transactionHash + eventType) — suppress.
-      return;
-    }
-    seen.push(identifier);
-    saveDedupeSet(wallet, seen);
+  const normalizedFilters = useMemo(() => normalizeFilters(filters), [filters]);
 
-    const deepLink = buildStreamDeepLink(event.streamId);
-
-    if (channelPrefs.inApp && onInAppRef.current) {
-      try {
-        onInAppRef.current(event, deepLink);
-      } catch {
-        // Sink errors must not prevent browser notification attempts.
-      }
-    }
-
-    if (channelPrefs.browser) {
-      const state = getPermissionState();
-      setPermission(state);
-      if (state.supported && state.permission === 'granted') {
-        try {
-          const notification = new window.Notification(
-            `Stream ${event.eventType.toLowerCase().replace('_', ' ')}`,
-            {
-              body: `Stream ${event.streamId}`,
-              tag: identifier,
-              data: { deepLink, streamId: event.streamId, eventType: event.eventType },
-            },
-          );
-          notification.onclick = () => {
-            try {
-              if (typeof window !== 'undefined') {
-                window.focus();
-                window.location.assign(deepLink);
-              }
-            } catch {
-              // Navigation failures are non-fatal.
-            }
-          };
-        } catch {
-          // Notification construction can fail; ignore gracefully.
-        }
-      }
-      // If permission is 'denied' or 'default', we silently skip browser
-      // notifications. In-app notifications above are unaffected.
-    }
-  }, []);
-
-  const resetPreferences = useCallback(() => {
-    const next = clonePreferences(DEFAULT_NOTIFICATION_PREFERENCES);
-    setPreferences(next);
-    persist(next);
-  }, [persist]);
-
-  return useMemo(
-    () => ({
-      preferences,
-      permission,
-      setChannelEnabled,
-      setAllForChannel,
-      requestBrowserPermission,
-      handleEvent,
-      resetPreferences,
-    }),
-    [
-      preferences,
-      permission,
-      setChannelEnabled,
-      setAllForChannel,
-      requestBrowserPermission,
-      handleEvent,
-      resetPreferences,
-    ],
+  const queryString = useMemo(
+    () => buildQueryString(normalizedFilters, cursor, limit),
+    [normalizedFilters, cursor, limit],
   );
+
+  const requestUrl = useMemo(() => {
+    if (!walletAddress) return null;
+    const trimmedBase = baseUrl.replace(/\/+$/, '');
+    return `${trimmedBase}/wallets/${encodeURIComponent(walletAddress)}/events${queryString}`;
+  }, [baseUrl, walletAddress, queryString]);
+
+  const queryKey = useMemo(
+    () =>
+      [
+        'stream-events',
+        network ?? null,
+        walletAddress ?? null,
+        normalizedFilters,
+        cursor ?? null,
+        limit ?? null,
+      ] as const,
+    [network, walletAddress, normalizedFilters, cursor, limit],
+  );
+
+  const isEnabled = enabled && !!walletAddress && !!requestUrl;
+
+  const query = useQuery<StreamEventsPage, Error>({
+    queryKey,
+    queryFn: ({ signal }) => {
+      if (!requestUrl) {
+        return Promise.resolve({ events: [], nextCursor: null, hasMore: false });
+      }
+      return fetchStreamEvents(requestUrl, signal);
+    },
+    enabled: isEnabled,
+    // Pagination is cursor-based and stable; avoid aggressive refetching that
+    // would shift pages under the user.
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    retry: (failureCount, error) => {
+      const status = (error as Error & { status?: number }).status;
+      // Do not retry client errors (bad filters, unauthorized, not found).
+      if (status && status >= 400 && status < 500) return false;
+      return failureCount < 2;
+    },
+  });
+
+  // Track whether we've ever resolved data for the current key so we can
+  // distinguish "initial loading" from background refetches.
+  const [hasResolved, setHasResolved] = useState(false);
+  const lastKeyRef = useRef<string>('');
+
+  const serializedKey = JSON.stringify(queryKey);
+
+  useEffect(() => {
+    if (lastKeyRef.current !== serializedKey) {
+      lastKeyRef.current = serializedKey;
+      setHasResolved(false);
+    }
+  }, [serializedKey]);
+
+  useEffect(() => {
+    if (query.isSuccess && !hasResolved) {
+      setHasResolved(true);
+    }
+  }, [query.isSuccess, hasResolved]);
+
+  const refetch = useCallback(() => {
+    void query.refetch();
+  }, [query]);
+
+  const events = query.data?.events ?? [];
+  const nextCursor = query.data?.nextCursor ?? null;
+  const hasMore = query.data?.hasMore ?? false;
+
+  const isInitialLoading = isEnabled && !hasResolved && (query.isLoading || query.isFetching);
+
+  return {
+    events,
+    nextCursor,
+    hasMore,
+    isLoading: isEnabled && (query.isLoading || query.isFetching),
+    isInitialLoading,
+    isFetching: query.isFetching,
+    error: query.error ?? null,
+    isEmpty: query.isSuccess && events.length === 0,
+    refetch,
+  };
 }
 
 export default useStreamEvents;

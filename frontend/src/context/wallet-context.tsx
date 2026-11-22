@@ -39,6 +39,10 @@ import {
 } from "@/lib/wallet";
 import { useNetwork } from "@/context/NetworkContext";
 import type { NetworkConfig } from "@/lib/stellar-config";
+import {
+  fetchOrganizationMembership,
+  type OrganizationMembership,
+} from "@/lib/organization";
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -77,14 +81,12 @@ interface WalletState {
   authToken: string | null;
   errorMessage: string | null;
   isHydrated: boolean;
-  /**
-   * Public key the user expects to be connected. Set when a session is
-   * established; used to detect a "wrong-account" recovery state when the
-   * extension reports a different key on reconnect.
-   */
-  expectedPublicKey: string | null;
-  /** True when the last failure was due to an unavailable wallet extension. */
-  walletUnavailable: boolean;
+  /** Organization membership for the authenticated user, or null. */
+  organization: OrganizationMembership | null;
+  /** True while the organization membership is being loaded. */
+  isOrganizationLoading: boolean;
+  /** Error message from the last organization load, or null. */
+  organizationError: string | null;
 }
 
 type WalletAction =
@@ -92,7 +94,10 @@ type WalletAction =
   | { type: "hydrate:idle" }
   | { type: "connect:start" }
   | { type: "connect:success"; session: WalletSession; authToken: string }
-  | { type: "connect:error"; message: string; walletUnavailable: boolean }
+  | { type: "connect:error"; message: string }
+  | { type: "organization:start" }
+  | { type: "organization:success"; organization: OrganizationMembership | null }
+  | { type: "organization:error"; message: string }
   | { type: "disconnect" };
 
 function reducer(state: WalletState, action: WalletAction): WalletState {
@@ -126,7 +131,29 @@ function reducer(state: WalletState, action: WalletAction): WalletState {
         session: null,
         authToken: null,
         errorMessage: action.message,
-        walletUnavailable: action.walletUnavailable,
+        organization: null,
+        isOrganizationLoading: false,
+        organizationError: null,
+      };
+    case "organization:start":
+      return {
+        ...state,
+        isOrganizationLoading: true,
+        organizationError: null,
+      };
+    case "organization:success":
+      return {
+        ...state,
+        organization: action.organization,
+        isOrganizationLoading: false,
+        organizationError: null,
+      };
+    case "organization:error":
+      return {
+        ...state,
+        organization: null,
+        isOrganizationLoading: false,
+        organizationError: action.message,
       };
     case "disconnect":
       return {
@@ -135,8 +162,9 @@ function reducer(state: WalletState, action: WalletAction): WalletState {
         session: null,
         authToken: null,
         errorMessage: null,
-        expectedPublicKey: null,
-        walletUnavailable: false,
+        organization: null,
+        isOrganizationLoading: false,
+        organizationError: null,
       };
     default:
       return state;
@@ -149,8 +177,9 @@ const initialState: WalletState = {
   authToken: null,
   errorMessage: null,
   isHydrated: false,
-  expectedPublicKey: null,
-  walletUnavailable: false,
+  organization: null,
+  isOrganizationLoading: false,
+  organizationError: null,
 };
 
 // ── Recovery messaging ────────────────────────────────────────────────────────
@@ -242,6 +271,22 @@ export interface WalletContextValue {
   isHydrated: boolean;
   /** Supported wallet definitions. */
   supportedWallets: WalletDefinition[];
+  /** Organization membership for the authenticated user, or null. */
+  organization: OrganizationMembership | null;
+  /** True while the organization membership is being loaded. */
+  isOrganizationLoading: boolean;
+  /** Error message from the last organization load, or null. */
+  organizationError: string | null;
+  /**
+   * Returns true when the connected wallet is the acting member's wallet and
+   * therefore authorized to sign on its own behalf.
+   *
+   * Always false when not connected, when no organization membership is
+   * loaded, or when `walletAddress` differs from the connected public key.
+   * Signing paths MUST gate on this helper — a member can never sign for
+   * another wallet.
+   */
+  canSignForWallet: (walletAddress: string) => boolean;
   /**
    * Derived recovery classification of the current wallet situation.
    * Drives the recovery journey UI. Never implies private-key recovery.
@@ -381,26 +426,45 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: "disconnect" });
   }, []);
 
-  const reconnect = useCallback(async () => {
-    const walletId = selectedWalletId ?? state.session?.walletId ?? null;
-    if (!walletId) {
-      // Nothing to reconnect to — surface the disconnected guidance.
-      dispatch({
-        type: "connect:error",
-        message: RECOVERY_MESSAGES.disconnected,
-        walletUnavailable: false,
-      });
+  // Load organization membership once authenticated.
+  useEffect(() => {
+    if (state.status !== "connected" || !state.session || !state.authToken) {
       return;
     }
-    await connect(walletId);
-  }, [connect, selectedWalletId, state.session?.walletId]);
 
-  const replaceWallet = useCallback(() => {
-    localStorage.removeItem(SESSION_KEY);
-    localStorage.removeItem(AUTH_KEY);
-    dispatch({ type: "disconnect" });
-    setWalletModalRequested(true);
-  }, []);
+    let cancelled = false;
+    dispatch({ type: "organization:start" });
+
+    fetchOrganizationMembership(state.authToken)
+      .then((membership) => {
+        if (cancelled) return;
+        dispatch({ type: "organization:success", organization: membership });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const message =
+          err instanceof Error ? err.message : "Failed to load organization membership.";
+        dispatch({ type: "organization:error", message });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.status, state.session, state.authToken]);
+
+  /**
+   * Ownership check: only the connected wallet may sign on its own behalf.
+   * Never returns true for a wallet address that differs from the session.
+   */
+  const canSignForWallet = useCallback(
+    (walletAddress: string): boolean => {
+      if (!state.session) return false;
+      if (!state.organization) return false;
+      if (typeof walletAddress !== "string" || walletAddress.length === 0) return false;
+      return walletAddress === state.session.publicKey;
+    },
+    [state.session, state.organization],
+  );
 
   /**
    * Returns true when the connected wallet's network matches the APP NETWORK.
@@ -475,8 +539,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       errorMessage: state.errorMessage,
       isHydrated: state.isHydrated,
       supportedWallets: SUPPORTED_WALLETS,
-      recoveryState,
-      recoveryMessage,
+      organization: state.organization,
+      isOrganizationLoading: state.isOrganizationLoading,
+      organizationError: state.organizationError,
+      canSignForWallet,
       connect,
       reconnect,
       replaceWallet,
@@ -490,8 +556,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       state.authToken,
       state.errorMessage,
       state.isHydrated,
-      recoveryState,
-      recoveryMessage,
+      state.organization,
+      state.isOrganizationLoading,
+      state.organizationError,
+      canSignForWallet,
       connect,
       reconnect,
       replaceWallet,

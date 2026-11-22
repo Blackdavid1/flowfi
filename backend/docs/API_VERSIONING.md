@@ -84,6 +84,35 @@ import v2Routes from './routes/v2/index.js';
 app.use('/v2', v2Routes);
 ```
 
+## Webhook Payload Versioning
+
+Webhook deliveries carry an explicit schema version so downstream consumers can evolve independently of the API version.
+
+### Supported Webhook Versions
+
+| Version | Status | Notes |
+|---------|--------|-------|
+| `v1` | ✅ Current | Default for all deliveries |
+
+- The version is sent in the `X-Webhook-Version` header and mirrored in the payload's `version` field.
+- Consumers MUST reject deliveries whose version they do not support rather than guessing the shape.
+- Adding optional fields is non-breaking; removing or retyping fields requires a new webhook version.
+
+### Delivery Semantics
+
+- **Signature verification** - Every delivery includes an `X-Webhook-Signature` HMAC over the raw body. Consumers MUST verify it before processing and reject mismatches.
+- **Duplicates** - Delivery is at-least-once. Consumers MUST deduplicate using the stable `X-Webhook-Id` / payload `id`.
+- **Out-of-order delivery** - Deliveries may arrive out of order. Consumers MUST order by the payload `sequence` (or event timestamp) rather than arrival time.
+
+### Compatibility Contract Suite
+
+A consumer-driven contract suite lives alongside the webhook tests and publishes reusable fixtures for partners:
+
+- `backend/tests/webhooks/contract/` - contract tests covering supported versions, signature verification, duplicate handling, and out-of-order delivery, including failure and boundary cases (invalid/missing signature, unknown version, replayed duplicate, out-of-order sequence).
+- `backend/tests/webhooks/contract/fixtures/` - versioned payload fixtures partners can reuse to validate their own consumers.
+
+Partners should run their consumer against the published fixtures and treat any fixture that no longer verifies as a breaking change requiring a new webhook version.
+
 ## Deprecation Policy
 
 ### Deprecation Timeline
@@ -226,6 +255,51 @@ Response:
   "supportedVersions": ["v1"]
 }
 ```
+
+## Event Contract Versioning
+
+Event payloads are versioned independently of the HTTP API version. Every event
+carries a `schemaVersion` field (currently `1`) so partner consumers can evolve
+at their own pace without being coupled to the REST surface.
+
+### Event Envelope
+
+```json
+{
+  "id": "evt_01H...",
+  "type": "stream.created",
+  "schemaVersion": 1,
+  "occurredAt": "2024-02-21T12:00:00.000Z",
+  "cursor": "1708516800000-42",
+  "data": { "streamId": "1", "sender": "GABC..." }
+}
+```
+
+### Consumer Contract Rules
+
+1. **Verify the signature before parsing** - Reject events whose HMAC signature
+   does not match the shared secret. Never trust unverified payloads.
+2. **Process idempotently** - Deduplicate on `id`; replays and duplicate
+   deliveries must not double-apply to the local projection.
+3. **Persist the cursor atomically** - Store the last applied `cursor` in the
+   same transaction as the projection update so restarts resume exactly once.
+4. **Recover from gaps** - On reconnect, resume from the persisted cursor and
+   re-request any missed range; never skip ahead silently.
+5. **Redact logs** - Log event `id`, `type`, and `cursor` only. Never log
+   payload bodies, signatures, or secrets.
+
+A reference implementation of these rules lives in
+[`examples/partner-event-consumer`](../examples/partner-event-consumer/README.md).
+
+### Event Schema Version Lifecycle
+
+| `schemaVersion` | Status | Notes |
+|-----------------|--------|-------|
+| `1` | ✅ Current | Initial event envelope |
+
+Adding optional fields to `data` is non-breaking and stays within the current
+`schemaVersion`. Removing or retyping fields requires a new `schemaVersion` and
+a deprecation window matching the HTTP policy above.
 
 ## Future Considerations
 
