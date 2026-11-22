@@ -103,11 +103,18 @@ function StreamBalance({ streamId, walletAddress }: { streamId: string; walletAd
 }
 ```
 
-## Indexer Startup Preflight
+The suite records a deterministic dataset definition and the query plans for
+each representative query. Runs are compared against these recorded fixtures so
+results are stable and comparable across releases. Fixtures live alongside the
+suite and are regenerated only when the schema or query set intentionally
+changes.
 
-Before the Soroban event worker begins polling, the indexer runs a preflight that validates the configured deployment identity. If any check fails, the worker does not start and no cursor or stream state is read or written — the process fails fast with an actionable diagnostic instead of indexing the wrong deployment.
+#### Regression thresholds
 
-The preflight verifies, in order:
+Each query has a bounded regression threshold (maximum allowed latency and plan
+regression). A run fails when a query exceeds its threshold, and passes when it
+is at or just under the threshold. Empty or minimal datasets are handled as a
+boundary case and must not error.
 
 Environment knobs (all optional):
 
