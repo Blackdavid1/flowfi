@@ -130,6 +130,36 @@ throughput for healthy clients.
 
 ---
 
+## Shared Stream Review Links
+
+Stream owners can share a read-only review of a stream via a scoped link. The
+link exposes **only** the fields the owner explicitly selects as public; it never
+reveals wallet addresses, session data, tokens, or secrets.
+
+### Expiry
+
+- Every share link has a TTL. The default is **7 days** and can be configured
+  per link (bounded by a server-side maximum).
+- Expiry is evaluated server-side on every read; an expired link returns a safe
+  `404 Not Found` (identical to an unknown token) so expiry cannot be probed.
+
+### Revocation
+
+- The stream owner can revoke a link at any time before expiry. Revocation is
+  immediate and idempotent.
+- Revoked links return the same safe `404 Not Found` response as expired or
+  unknown links.
+
+### Privacy Boundary
+
+- The shared payload is built from an explicit allow-list of public fields
+  (e.g. stream id, status, amounts, timestamps). Private wallet/session data is
+  never included.
+- The share endpoint is strictly read-only: any mutating method or attempt to
+  access non-public data is rejected with `403 Forbidden`.
+
+---
+
 ## Keeper-Key Authorization Model
 
 FlowFi splits transaction signing into two categories: custodial (server-signed)
@@ -167,39 +197,6 @@ for the transaction.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
 
----
-
-## Mobile Wallet Deep-Link Signer Adapter
-
-The SDK exposes a `MobileWalletDeepLinkSigner` adapter so mobile wallets can
-sign non-custodial actions (withdraw, pause/resume, create stream) via a
-deep-link handoff. The adapter is a **signer only** — it never receives, stores,
-or transmits secret material. The application and backend only ever see the
-unsigned transaction XDR and the returned signed XDR.
-
-### Adapter Interface
-
-```ts
-export interface MobileWalletDeepLinkSigner {
-  /** Build a deep link that hands the unsigned XDR to the wallet. */
-  buildDeepLink(request: DeepLinkSignRequest): string;
-  /** Validate and parse the wallet's return callback. */
-  parseReturn(params: DeepLinkReturnParams): DeepLinkSignResult;
-  /** Abort an in-flight handoff (user cancelled or timeout). */
-  cancel(reason?: string): void;
-}
-```
-
-### Supported Wallet Capabilities
-
-| Capability | Supported | Notes |
-|------------|-----------|-------|
-| Sign arbitrary transaction XDR | Yes | Wallet returns signed XDR only. |
-| Network / passphrase binding | Yes | Request carries `networkPassphrase`; response must match. |
-| Cancellation signal | Yes | Wallet returns `status=cancelled` or the app calls `cancel()`. |
-| Secret export | **No** | The adapter never requests or accepts secret keys. |
-| Server-side submission | **No** | Submission stays client-side; backend never signs these actions. |
-
 ### Cancellation
 
 A handoff can be cancelled by the user (wallet returns `status=cancelled`) or by
@@ -225,10 +222,60 @@ request was built for. A mismatch (e.g. mainnet response for a testnet request)
 is rejected with `DeepLinkNetworkMismatchError` before the signed XDR is used.
 This preserves chain/network validation and prevents cross-network replay.
 
-### Secret-Handling Requirements
+## Verifier-Backed Conditional Release Policies
 
-- The adapter accepts only unsigned XDR and returns signed XDR.
-- No secret key, mnemonic, or seed is ever passed to the adapter, logged, or
-  sent to the backend.
-- The backend does not gain a submit path for these actions; the non-custodial
-  security model above is unchanged.
+Some streams gate accrual or release on the result of an external verifier
+(e.g. an oracle, attestation service, or off-chain job runner). This section
+defines the trust model and failure semantics for those streams. The interface
+is additive: streams without a configured verifier keep the existing
+unconditional accrual/release behavior.
+
+### Verifier Identity
+
+- A verifier is identified by a stable `verifierId` (opaque string) plus the
+  on-chain `verifierAddress` that is authorized to submit results. Both are
+  configured at stream creation and are immutable for the life of the stream.
+- Only results whose `verifierAddress` matches the stream's configured address
+  are accepted. Results from any other address are rejected and never mutate
+  stream state.
+- The backend treats the verifier as an **untrusted external input**: it
+  validates identity and shape, but does not assume the verifier is honest or
+  available.
+
+### Trust Assumptions
+
+> **The verifier is trusted only to report its own result — not to move funds,
+> change stream parameters, or bypass wallet authorization.** Release still
+> requires the normal wallet-signed withdraw path; the verifier result only
+> determines *whether* accrual/release is permitted, never *who* may trigger it.
+
+- Verifier results are advisory gates. They cannot weaken wallet authorization,
+  chain/network validation, or financial accounting invariants.
+- The verifier's correctness (e.g. whether a job truly succeeded) is outside the
+  protocol's trust boundary; the protocol only enforces that a result came from
+  the configured verifier and was well-formed.
+
+### Timeout, Failure, and Replay Semantics
+
+| Condition | Behavior |
+|-----------|----------|
+| **No result yet** | Stream accrues/releases per its default policy until a valid result arrives. |
+| **Timeout** | If no valid result arrives within the configured `verifierTimeoutSeconds`, the stream falls back to its configured failure mode (see below). |
+| **Verifier unavailable** | Treated as a timeout once the deadline passes; the failure mode applies. |
+| **Malformed response** | Rejected without mutating state; the stream remains in its pre-result state and the timeout clock continues. |
+| **Wrong verifier identity** | Rejected without mutating state (same as malformed). |
+| **Replay / duplicate result** | Results are keyed by `(streamId, verifierId, nonce)`. A result whose nonce was already consumed is ignored; it never re-triggers release. |
+
+**Failure modes** (configured per stream):
+
+- `block` — accrual/release is blocked until a valid result arrives (default).
+- `release` — accrual/release proceeds as if the verifier returned success.
+
+### Operational Notes
+
+- Malformed or unavailable verifier responses are logged with the stream ID and
+  verifier ID but never surface raw verifier payloads to clients.
+- The timeout boundary is inclusive of the deadline: a result arriving exactly at
+  `verifierTimeoutSeconds` is accepted; anything later is treated as a timeout.
+- Replay protection relies on the consumed-nonce set; operators must not reuse
+  nonces when re-submitting results.
