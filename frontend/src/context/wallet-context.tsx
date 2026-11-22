@@ -53,6 +53,28 @@ const AUTH_KEY = "flowfi.wallet.auth.v1";
 
 export type WalletStatus = "idle" | "connecting" | "connected" | "error";
 
+/**
+ * Recovery state — a derived, user-facing classification of the current
+ * wallet situation. Used by the recovery journey UI to explain what the user
+ * can do next. It NEVER implies that FlowFi can recover a private key.
+ *
+ *  "connected"          Wallet is connected and authenticated.
+ *  "disconnected"       No wallet session (fresh, or after disconnect).
+ *  "wrong-account"      A wallet is connected but its public key does not
+ *                       match the account the user expects (e.g. they
+ *                       switched accounts inside the extension).
+ *  "revoked-session"    A session exists but the auth token is missing or
+ *                       expired — the backend will reject signed requests.
+ *  "unavailable-wallet" The wallet extension is not installed/available, or
+ *                       the last connection attempt failed.
+ */
+export type WalletRecoveryState =
+  | "connected"
+  | "disconnected"
+  | "wrong-account"
+  | "revoked-session"
+  | "unavailable-wallet";
+
 interface WalletState {
   status: WalletStatus;
   session: WalletSession | null;
@@ -99,6 +121,8 @@ function reducer(state: WalletState, action: WalletAction): WalletState {
         session: action.session,
         authToken: action.authToken,
         errorMessage: null,
+        expectedPublicKey: action.session.publicKey,
+        walletUnavailable: false,
       };
     case "connect:error":
       return {
@@ -157,6 +181,42 @@ const initialState: WalletState = {
   isOrganizationLoading: false,
   organizationError: null,
 };
+
+// ── Recovery messaging ────────────────────────────────────────────────────────
+
+/**
+ * Copy shown in the recovery journey. Every message is explicit that FlowFi
+ * cannot recover a private key and that address-bound records stay tied to
+ * the original public key.
+ */
+export const RECOVERY_MESSAGES = {
+  disconnected:
+    "No wallet is connected. Reconnect the same wallet to regain access. " +
+    "FlowFi cannot recover a private key — only your wallet provider holds it.",
+  wrongAccount:
+    "The connected wallet account does not match the account this session was " +
+    "created for. Switch back to the original account in your wallet, or replace " +
+    "the wallet. Records bound to the original address stay tied to that public " +
+    "key and cannot be moved by connecting a different account.",
+  revokedSession:
+    "Your session has expired or been revoked. Reconnect and sign the " +
+    "authentication challenge again. FlowFi cannot recover a private key.",
+  unavailableWallet:
+    "The wallet extension is not available. Install or unlock it, then reconnect. " +
+    "FlowFi cannot recover a private key.",
+} as const;
+
+/** Heuristic: does this error indicate the wallet extension is unavailable? */
+function isWalletUnavailableError(err: unknown): boolean {
+  const message = toWalletErrorMessage(err).toLowerCase();
+  return (
+    message.includes("not installed") ||
+    message.includes("not available") ||
+    message.includes("not detected") ||
+    message.includes("no wallet") ||
+    message.includes("extension")
+  );
+}
 
 // ── Auth token helpers ────────────────────────────────────────────────────────
 
@@ -228,10 +288,32 @@ export interface WalletContextValue {
    */
   canSignForWallet: (walletAddress: string) => boolean;
   /**
+   * Derived recovery classification of the current wallet situation.
+   * Drives the recovery journey UI. Never implies private-key recovery.
+   */
+  recoveryState: WalletRecoveryState;
+  /**
+   * Human-readable guidance for the current recoveryState. Always states that
+   * FlowFi cannot recover a private key and that address-bound records remain
+   * tied to the original public key.
+   */
+  recoveryMessage: string;
+  /**
    * Connect a wallet by ID (e.g. "freighter").
    * Calls connectWallet() → authenticateWallet() and persists the session.
    */
   connect: (walletId: string) => Promise<void>;
+  /**
+   * Re-run connect() for the currently selected wallet. Used by the recovery
+   * journey to retry a disconnected, revoked, or unavailable wallet.
+   */
+  reconnect: () => Promise<void>;
+  /**
+   * Disconnect the current wallet and open the wallet modal so the user can
+   * pick a different wallet. Address-bound records stay tied to the original
+   * public key — this does not migrate them.
+   */
+  replaceWallet: () => void;
   /**
    * Disconnect: clears session, authToken, and localStorage entries.
    */
@@ -257,6 +339,10 @@ const WalletContext = createContext<WalletContextValue | undefined>(undefined);
 export function WalletProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { network: appNetwork } = useNetwork();
+  // Wallet the user last selected; used by reconnect()/replaceWallet().
+  const [selectedWalletId, setSelectedWalletId] = React.useState<string | null>(null);
+  // Set by replaceWallet() to signal the wallet modal should open.
+  const [walletModalRequested, setWalletModalRequested] = React.useState(false);
 
   // Hydrate from localStorage on first render.
   useEffect(() => {
@@ -311,6 +397,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const connect = useCallback(async (walletId: string) => {
+    setSelectedWalletId(walletId);
     dispatch({ type: "connect:start" });
     try {
       const session = await connectWallet(walletId);
@@ -325,7 +412,11 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       // Clear any stale persisted session on failure.
       localStorage.removeItem(SESSION_KEY);
       localStorage.removeItem(AUTH_KEY);
-      dispatch({ type: "connect:error", message: toWalletErrorMessage(err) });
+      dispatch({
+        type: "connect:error",
+        message: toWalletErrorMessage(err),
+        walletUnavailable: isWalletUnavailableError(err),
+      });
     }
   }, []);
 
@@ -402,6 +493,44 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     [state.session],
   );
 
+  /**
+   * Derive the recovery state from the current status/session/authToken.
+   * Order matters: a connected session with a mismatched public key is
+   * "wrong-account"; a connected session without a valid token is
+   * "revoked-session"; a failed connect is "unavailable-wallet".
+   */
+  const recoveryState = useMemo<WalletRecoveryState>(() => {
+    if (state.status === "connected" && state.session) {
+      if (state.expectedPublicKey && state.session.publicKey !== state.expectedPublicKey) {
+        return "wrong-account";
+      }
+      if (!state.authToken || !isTokenValid(state.authToken)) {
+        return "revoked-session";
+      }
+      return "connected";
+    }
+    if (state.status === "error") {
+      return state.walletUnavailable ? "unavailable-wallet" : "disconnected";
+    }
+    return "disconnected";
+  }, [state.status, state.session, state.authToken, state.expectedPublicKey, state.walletUnavailable]);
+
+  const recoveryMessage = useMemo<string>(() => {
+    switch (recoveryState) {
+      case "connected":
+        return "";
+      case "wrong-account":
+        return RECOVERY_MESSAGES.wrongAccount;
+      case "revoked-session":
+        return RECOVERY_MESSAGES.revokedSession;
+      case "unavailable-wallet":
+        return RECOVERY_MESSAGES.unavailableWallet;
+      case "disconnected":
+      default:
+        return RECOVERY_MESSAGES.disconnected;
+    }
+  }, [recoveryState]);
+
   const value = useMemo<WalletContextValue>(
     () => ({
       status: state.status,
@@ -415,6 +544,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       organizationError: state.organizationError,
       canSignForWallet,
       connect,
+      reconnect,
+      replaceWallet,
       disconnect,
       isWalletOnAppNetwork,
       assertWalletOnAppNetwork,
@@ -430,6 +561,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       state.organizationError,
       canSignForWallet,
       connect,
+      reconnect,
+      replaceWallet,
       disconnect,
       isWalletOnAppNetwork,
       assertWalletOnAppNetwork,
