@@ -24,15 +24,171 @@ model Stream {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  // Deterministic linkage to a recurring schedule (#221).
-  // Null for standalone streams; set for instances spawned by a schedule.
-  scheduleId      String?
-  scheduleIndex   Int?
-  schedule        RecurringSchedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  // Relations
+  sentStreams     Stream[] @relation("SentStreams")
+  receivedStreams Stream[] @relation("ReceivedStreams")
+
+  @@index([publicKey])
+}
+
+// Stream model - mirrors on-chain stream state for fast querying
+model Stream {
+  id                String    @id @default(uuid())
+  streamId          BigInt    @unique // On-chain stream ID (Soroban u64)
+  sender            String    // Sender's Stellar public key
+  recipient         String    // Recipient's Stellar public key
+  tokenAddress      String    // Token contract address
+  ratePerSecond     String    // Rate as string to preserve precision (i128)
+  depositedAmount   String    // Total deposited amount (i128)
+  withdrawnAmount   String    // Total withdrawn amount (i128)
+  startTime         BigInt    // Unix timestamp when stream started
+  lastUpdateTime    BigInt    // Unix timestamp of last update
+  endTime           BigInt?   // Unix timestamp when stream ends
+  isActive          Boolean   @default(true)
+  isPaused          Boolean   @default(false)
+  pausedAt          BigInt?   // Unix timestamp when paused
+  totalPausedDuration Int     @default(0) // Accumulated paused duration in seconds
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // Relations
+  senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
+  recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
+  events            StreamEvent[]
+  releasePolicy     StreamReleasePolicy?
 
   @@unique([scheduleId, scheduleIndex])
   @@index([sender])
   @@index([recipient])
+  @@index([tokenAddress])
+  @@index([isActive])
+  @@index([isPaused])
+}
+
+// StreamReleasePolicy model - verifier-backed conditional release policy (issue #214).
+//
+// A stream may be gated so that accrual/release only happens once a configured
+// verifier returns a positive result. Trust assumptions are explicit:
+//   * `verifierAddress` is the ONLY trusted identity. Results signed by any other
+//     key are rejected; the verifier is trusted to answer honestly for the
+//     `policyKey` it is asked about (it is NOT trusted to move funds).
+//   * `timeoutSeconds` bounds how long a pending verification may block release.
+//     On timeout the stream falls back to `onTimeout` (default: keep locked).
+//   * `onFailure` defines behavior when the verifier is unavailable or returns a
+//     malformed response (default: keep locked, never auto-release).
+//   * Replay protection: each verification result carries a unique `nonce`; the
+//     `(streamId, nonce)` pair is unique so a replayed result cannot release twice.
+model StreamReleasePolicy {
+  id              String   @id @default(uuid())
+  streamId        BigInt   @unique
+  verifierAddress String   // Trusted verifier Stellar public key (G...)
+  policyKey       String   // Opaque key the verifier answers about
+  timeoutSeconds  Int      @default(3600) // Max wait before onTimeout applies
+  onTimeout       String   @default("LOCK") // "LOCK" | "RELEASE"
+  onFailure       String   @default("LOCK") // "LOCK" | "RELEASE"
+  lastNonce       String?  // Highest accepted verifier nonce (replay guard)
+  isReleased      Boolean  @default(false)
+  releasedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  stream          Stream   @relation(fields: [streamId], references: [streamId], onDelete: Cascade)
+  results         VerifierResult[]
+
+  @@index([verifierAddress])
+  @@index([isReleased])
+}
+
+// VerifierResult model - records verifier responses for audit and replay defense.
+// `(policyId, nonce)` is unique so a replayed verifier result is rejected at the
+// storage layer, independent of application-level checks.
+model VerifierResult {
+  id          String   @id @default(uuid())
+  policyId    String
+  nonce       String   // Unique per verifier response; replay guard
+  approved    Boolean
+  rawResponse String?  // Original response payload for audit/debugging
+  receivedAt  DateTime @default(now())
+
+  policy      StreamReleasePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, nonce])
+  @@index([policyId])
+  @@index([receivedAt])
+}
+
+// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
+//
+// Concurrency contract (issue #43): replay, reset, and normal polling all mutate
+// this single row. Writers MUST take a row-level lock (SELECT ... FOR UPDATE) on
+// the singleton row inside a transaction before reading or advancing the cursor,
+// so an admin replay cannot race the live worker or move the cursor backwards.
+// The `version` column is an optimistic-concurrency guard: every write bumps it
+// and callers that observed a stale version must retry. `lastCursor` is only ever
+// advanced monotonically (never regressed) by the poll loop; replay/reset are the
+// only operations allowed to rewind it, and they do so under the same lock.
+model IndexerState {
+  id          String   @id @default("singleton")
+  lastLedger  Int      @default(0)
+  lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
+  version     Int      @default(0) // Optimistic-concurrency guard; bumped on every write
+  updatedAt   DateTime @updatedAt
+}
+
+// LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
+// signature, and event count the indexer ingested. Written on every ingestion
+// cycle so the worker can (a) prove the canonical chain still contains what it
+// indexed and (b) roll back deterministically when a fork replaces it.
+//
+// Snapshot contract (issue #228): the highest non-reverted ledgerSequence is the
+// single indexed checkpoint that ledger-consistent multi-resource snapshots are
+// pinned to. Stream, event, and balance reads for a snapshot MUST be filtered to
+// ledgerSequence <= that checkpoint so clients never combine data from different
+// ledgers. When the indexer lags behind the chain tip, the snapshot reports
+// staleness metadata and clients should retry rather than merge results.
+model LedgerCheckpoint {
+  ledgerSequence Int      @id
+  ledgerHash     String
+  parentHash     String
+  processedAt    DateTime @default(now())
+  eventsCount    Int
+  stateRootHash  String?
+  isReverted     Boolean  @default(false)
+
+  @@index([processedAt])
+  @@index([isReverted, ledgerSequence])
+}
+
+// StreamEvent model - indexer events for tracking all on-chain stream activities
+model StreamEvent {
+  id              String   @id @default(uuid())
+  streamId        BigInt   // Reference to on-chain stream ID (Soroban u64)
+  eventType       String   // EventType: "CREATED", "TOPPED_UP", "WITHDRAWN", "CANCELLED", "COMPLETED", "PAUSED", "RESUMED"
+  amount          String?  // Amount involved in the event (for top-ups, withdrawals)
+  transactionHash String   // Stellar transaction hash
+  ledgerSequence  Int      // Ledger sequence number
+  timestamp       BigInt   // Unix timestamp
+  metadata        String?  // JSON string for additional event data
+  createdAt       DateTime @default(now())
+
+  // Relations
+  stream          Stream   @relation(fields: [streamId], references: [streamId])
+
+  @@unique([transactionHash, eventType])
+  @@index([streamId])
+  @@index([eventType])
+  @@index([streamId, eventType])
+  @@index([timestamp])
+  @@index([transactionHash])
+  @@index([createdAt])
+  @@index([streamId, timestamp])
+  // Canonical ordering index: (streamId, ledgerSequence) gives deterministic
+  // blockchain-ordered event listings. ledger_sequence is the total order on
+  // Stellar — no two events in different ledgers share a sequence number.
+  @@index([streamId, ledgerSequence])
+  // Snapshot index (issue #228): supports ledger-bounded event reads for a
+  // single checkpoint (ledgerSequence <= checkpoint) without a full scan.
+  @@index([ledgerSequence])
 }
 
 enum StreamStatus {
@@ -41,38 +197,4 @@ enum StreamStatus {
   CANCELLED
 }
 
-// Bounded recurring schedule (#221).
-// Limits are enforced at the contract/API layer; the schema stores the
-// declared bounds so instances can be derived deterministically.
-model RecurringSchedule {
-  id              String   @id @default(cuid())
-  sender          String
-  recipient       String
-  token           String
-  // Per-instance funding amount; each instance is funded independently.
-  amountPerInstance String
-  // Interval between instance start times, in seconds.
-  intervalSeconds Int
-  // First instance start time.
-  startTime       DateTime
-  // Maximum number of instances that may be spawned from this schedule.
-  maxInstances    Int
-  // Number of instances already spawned (monotonic; guards duplicate execution).
-  spawnedCount    Int      @default(0)
-  // Duration of each instance, in seconds.
-  instanceDurationSeconds Int
-  status          ScheduleStatus @default(ACTIVE)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  instances       Stream[]
-
-  @@index([sender])
-  @@index([status])
-}
-
-enum ScheduleStatus {
-  ACTIVE
-  COMPLETED
-  CANCELLED
-}
+// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
