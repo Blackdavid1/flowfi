@@ -9,6 +9,21 @@ import {
   type StreamChangePreviewInput,
 } from "@/lib/streamChangePreview";
 
+export type FeeEstimateStatus = "available" | "unavailable" | "pending";
+
+export interface FeeEstimate {
+  /** Estimated fee amount in the network's native unit, as a display string. */
+  amount: string;
+  /** Native unit symbol, e.g. "XLM". */
+  unit: string;
+  /** When the estimate was produced. */
+  fetchedAt: Date | number;
+  /** Congestion context, e.g. "low", "moderate", "high". */
+  congestion?: string;
+  /** Optional simulation status, e.g. "simulated", "not simulated". */
+  simulation?: string;
+}
+
 interface StreamActionReviewModalProps {
   title: string;
   actionLabel: string;
@@ -20,6 +35,14 @@ interface StreamActionReviewModalProps {
   preview?: StreamChangePreviewInput;
   onConfirm: () => void | Promise<void>;
   onClose: () => void;
+  /** Optional fee estimate; when omitted no cost section is rendered. */
+  feeEstimate?: FeeEstimate | null;
+  /** Status of the fee estimate. Defaults to "available" when feeEstimate is set. */
+  feeStatus?: FeeEstimateStatus;
+  /** Age (ms) after which an estimate is considered stale. Defaults to 60s. */
+  staleAfterMs?: number;
+  /** Optional message shown when the fee estimate is unavailable. */
+  unavailableMessage?: string;
 }
 
 const formatPreviewValue = (value: string | number | null | undefined): string => {
@@ -86,6 +109,10 @@ export const StreamActionReviewModal: React.FC<StreamActionReviewModalProps> = (
   preview,
   onConfirm,
   onClose,
+  feeEstimate,
+  feeStatus,
+  staleAfterMs = DEFAULT_STALE_AFTER_MS,
+  unavailableMessage,
 }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const dialogRef = useModalDialog({ onClose, isCloseDisabled: isSubmitting });
