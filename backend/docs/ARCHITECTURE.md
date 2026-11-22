@@ -9,6 +9,11 @@ For the full project-wide architecture (event type data flows, pause/resume
 timing, environment variables, and operational runbook) see
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
+For the field-level privacy and retention inventory (wallet-linked fields across
+logs, analytics, exports, webhooks, and backups) see
+[Field-Level Privacy & Retention Inventory](#field-level-privacy--retention-inventory)
+below.
+
 ---
 
 ## Architecture Decision Records

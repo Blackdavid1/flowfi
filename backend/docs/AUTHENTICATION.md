@@ -13,6 +13,71 @@ Authentication is performed in two phases:
 
 This simplifies clients and standardizes authentication across all protected routes.
 
+## Partner Onboarding: Credentials, Webhooks, and Go-Live
+
+External partners integrate in two isolated environments. **Testnet and production never share credentials, endpoints, or secrets.** Complete and validate the testnet path end-to-end before requesting production access.
+
+### 1. Configure credentials (per environment)
+
+Each environment has its own values. Never copy a testnet secret into production or vice versa.
+
+| Setting | Testnet | Production |
+| --- | --- | --- |
+| API base URL | `https://api.testnet.flowfi.example` | `https://api.flowfi.example` |
+| Stellar network passphrase | `Test SDF Network ; September 2015` | `Public Global Stellar Network ; September 2015` |
+| `AUTH_AUDIENCE` | `flowfi-testnet` | `flowfi-production` |
+| Partner API key | issued per testnet app | issued per production app (separate) |
+| Webhook signing secret | testnet-only secret | production-only secret |
+
+Store secrets in your secret manager, never in source control. The server only ever sees your Stellar **public** key and signed challenges — it never receives your secret key.
+
+### 2. Validate webhook handling
+
+Webhooks are signed. Verify the signature against the **environment-specific** signing secret before trusting the payload, and reject on mismatch.
+
+```bash
+# Runnable testnet sample: send a signed test event to your handler
+curl -X POST "$PARTNER_WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-FlowFi-Signature: $(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/^.* //')" \
+  -d "$BODY"
+```
+
+Checklist:
+
+- [ ] Handler rejects requests with a missing or invalid `X-FlowFi-Signature` (expect `401`).
+- [ ] Handler rejects a payload signed with the *other* environment's secret (testnet/production mismatch).
+- [ ] Handler is idempotent on duplicate delivery (dedupe by event id).
+- [ ] Handler returns `2xx` quickly and processes asynchronously.
+
+### 3. Test reconciliation
+
+Reconciliation confirms your ledger matches FlowFi's reported state.
+
+```bash
+# Runnable testnet sample: fetch settled transactions for a window
+curl -X GET "$API_BASE_URL/v1/transactions?from=$FROM&to=$TO" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Checklist:
+
+- [ ] Sum of your recorded amounts equals the API-reported totals for the window.
+- [ ] Boundary cases pass: empty window, single transaction, and a window spanning a settlement cutoff.
+- [ ] A deliberately mismatched record is detected and surfaced, not silently dropped.
+
+### 4. Clean-environment validation before go-live
+
+Before publication/production access, run the full flow from a **clean environment** (fresh credentials, empty state, no cached tokens):
+
+1. Request a challenge, sign it, and exchange it for a JWT (see [Wallet Challenges](#wallet-challenges-single-use-replay-resistant)).
+2. Confirm a reused challenge is rejected with `401 CHALLENGE_ALREADY_USED`.
+3. Confirm a challenge signed for the wrong network is rejected with `401 CHALLENGE_NETWORK_MISMATCH`.
+4. Deliver a signed webhook and confirm acceptance; deliver a bad-signature webhook and confirm rejection.
+5. Run reconciliation and confirm totals match.
+
+Only after every step passes on testnet should you request production credentials and repeat steps 1–5 against production with production-only secrets.
+
 ## Using the Middleware
 
 ### Protected Routes
