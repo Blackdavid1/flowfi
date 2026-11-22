@@ -48,7 +48,7 @@ export interface TokenMetadata {
   icon?: string;
   /** Short description shown in token pickers. */
   description?: string;
-  /** True for assets curated by FlowFi. */
+  /** True for assets curated by FlowFi. Retained for backwards compatibility. */
   verified: boolean;
   /** Provenance of the metadata. */
   source: TokenMetadataSource;
@@ -103,6 +103,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/xlm.svg',
       description: 'Native Stellar token',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.XLM_TOKEN_ADDRESS ??
+            'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCN',
+        },
+      ],
     },
     {
       symbol: 'USDC',
@@ -115,6 +125,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/usdc.svg',
       description: 'USD Coin',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.USDC_TOKEN_ADDRESS ??
+            'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+        },
+      ],
     },
     {
       symbol: 'EURC',
@@ -127,6 +147,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/eurc.svg',
       description: 'Euro Coin',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.EURC_TOKEN_ADDRESS ??
+            'CCWAMYJME4YOIUNAKVYEBYOG5I65QMKEX2NMN4OJAPXRPIF24ONPSHY',
+        },
+      ],
     },
   ];
 }
@@ -331,6 +361,22 @@ export function markTokenMetadataUnavailable(
     staleReason: reason,
     trustLevel: reason === 'malformed_source' ? 'fallback' : 'unknown',
   };
+}
+
+/**
+ * Look up a token by symbol and network. Returns `undefined` when the symbol is
+ * unknown, and the token (with its raw identifiers intact) when it is known but
+ * blocked — callers decide how to surface the block.
+ */
+export function getTokenMetadataForNetwork(
+  symbol: string,
+  network: string,
+): TokenMetadata | undefined {
+  const token = getTokenMetadata(symbol);
+  if (!token) return undefined;
+  const scoped = token.addresses?.find((a) => a.network === network);
+  if (!scoped) return token;
+  return { ...token, contractAddress: scoped.contractAddress };
 }
 
 /** Remove a token. Also bumps the version so caches are invalidated. */

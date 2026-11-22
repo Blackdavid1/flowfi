@@ -134,7 +134,7 @@ export function isTokenMetadataTrusted(
   return !isTokenMetadataStale(token, now);
 }
 
-export function useTokenMetadata() {
+export function useTokenMetadata(network?: string) {
   return useQuery({
     queryKey: TOKEN_METADATA_QUERY_KEY,
     queryFn: fetchTokenMetadata,

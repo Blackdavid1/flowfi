@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { mockConnectedWallet, RECIPIENT_PUBLIC_KEY } from "./utils/freighter";
 
 const MOCK_API_URL = "http://localhost:3100";
@@ -7,7 +7,6 @@ const SENDER_PUBLIC_KEY = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLF
 const SCHEDULE_ID = "7";
 const SCHEDULE_AMOUNT = "250";
 const SCHEDULE_INTERVAL_LABEL = "Weekly";
-=======
 
 test("stream detail page shows stream state and reflects a withdrawal via mock events", async ({
   page,
