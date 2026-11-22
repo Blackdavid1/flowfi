@@ -168,17 +168,19 @@ three signers, and every `FlowFiClient` method with mocked RPC/signer shims
 (no network I/O).
 
 [openapi-generator]: https://openapi-generator.tech/
-### Mobile wallet universal links
+### React stream lifecycle
 
-Configure MobileWalletSigner with trusted HTTPS walletLink and returnLink
-endpoints, the connected publicKey, networkPassphrase and a platform handoff
-function. Use OS-verified app links on both ends. The handoff opens the request
-and resolves with the incoming callback URL. Remove callback listeners on
-return, timeout or abort. Avoid analytics and URL logging on both endpoints.
+Import `useStream` from `@flowfi/sdk/react` inside a component. Pass a stable
+transport whose load method reads current state and whose subscribe method
+registers a change listener and returns its cleanup function.
 
-Compatible wallets must accept envelope, account, network, state and returnLink
-query parameters, display the transaction for approval, and echo network and
-state on return. Return status=signed with the signed envelope, or
-status=cancelled. Wallets retain their keys and must never submit the envelope.
-This protocol requires explicit wallet support. Pass the matching networkPassphrase
-to signTransaction. AbortSignal and timeoutMs cancel the pending application request.
+```tsx
+const state = useStream(transport, streamId, walletAddress);
+if (state.status === 'loading') return <p>Loading stream…</p>;
+if (state.status === 'error') return <p>Stream unavailable</p>;
+return <p>{state.value.status}</p>;
+```
+
+Server rendering returns loading without opening a connection. Changing the
+wallet or stream starts a fresh store. Other frameworks can subscribe to
+`createStreamStore(transport, streamId, walletAddress)` from the core package.
