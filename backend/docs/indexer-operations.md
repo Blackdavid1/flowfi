@@ -3,10 +3,167 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the ledger-consistent snapshot
+endpoint, and the indexer metrics. It is written for operators and on-call
+engineers. All public interfaces described here are additive; existing
+endpoints and configuration keys keep working unless noted.
+
+---
+
+## 0. Field-level privacy and retention inventory
+
+This inventory maps every wallet-linked field family the indexer touches to
+its data store, purpose, retention rule, deletion constraint, and owner. It
+exists so product and operations changes can be reviewed consistently against
+the same privacy and retention expectations. Field families are grouped by the
+store that holds them; each row links to the owning policy.
+
+### Field families
+
+| Field family | Data store | Purpose | Retention rule | Deletion constraint | Owner | Policy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `wallet_address` (sender/recipient) | `streams`, `events` tables | Stream/event indexing and per-wallet history | Retained for the life of the indexed ledger record; no TTL | Cannot be deleted while the stream is referenced by an event; deletion requires a replay/reset of the affected ledger range | Indexer team | `SECURITY.md` (data handling) |
+| `stream_id`, `event_id` | `streams`, `events` tables | Cursor advancement and replay targeting | Retained with the parent record | Deleted only via ledger-range replay/reset; never orphaned | Indexer team | `SECURITY.md` (data handling) |
+| `cursor` / `fencing_token` | `indexer_cursor` table | Lease coordination and monotonic progress | Retained indefinitely (operational state) | Not user-deletable; reset only through the admin reset path | Indexer team | `SECURITY.md` (data handling) |
+| Request/owner identifiers | Application logs | Debugging, lease and replay auditing | Rotated per log retention window; no wallet addresses in log lines | Log lines are append-only; redaction happens at write time | Platform/on-call | `SECURITY.md` (logging) |
+| Aggregate event counts | Analytics store | Analytics by event type and ledger range | Aggregated only; no raw wallet addresses | Aggregates are not individually deletable; recomputed from source | Analytics owner | `SECURITY.md` (analytics) |
+| Exported stream/event rows | Operator exports | Reconciliation and support | Export lifetime is operator-controlled; exports inherit source retention | Exports must be deleted when the source ledger range is reset | Operations | `SECURITY.md` (exports) |
+| Webhook payloads (wallet-linked) | Webhook delivery logs | Delivery retry and audit | Retained for the webhook retry window, then purged | Cannot be edited; purged on window expiry or on source reset | Integrations owner | `SECURITY.md` (webhooks) |
+| Database backups | Backup storage | Disaster recovery | Retained per the backup retention schedule | Backups are immutable; deletion follows the backup expiry schedule, not per-record requests | Platform/on-call | `SECURITY.md` (backups) |
+
+### Review rules
+
+- Every new wallet-linked field family **must** be added to this table with a
+  store, purpose, retention rule, deletion constraint, owner, and policy link
+  before it ships.
+- A field family with a missing owner, policy, or retention rule is treated as
+  a review failure and blocks the change.
+- Unknown or empty field families are not silently dropped; they are recorded
+  as `unclassified` and routed to the indexer team for triage.
+- Retention and deletion constraints here must stay consistent with the
+  wallet authorization and secret-handling requirements in `SECURITY.md`.
+
+---
+
+## 0.1 Partner onboarding and go-live checklist
+
+This section gives an external integration team a verified path from zero to
+production traffic. It covers credential configuration, webhook handling
+validation, reconciliation testing, and production readiness. Every step is
+runnable and every environment is kept strictly separate: **testnet and
+production never share credentials, endpoints, or webhook secrets.**
+
+### Environment separation
+
+| Concern | Testnet | Production |
+| --- | --- | --- |
+| API base URL | `https://api.testnet.example.com` | `https://api.example.com` |
+| Soroban RPC | `https://soroban-testnet.stellar.org` | Operator-provided mainnet RPC |
+| Network passphrase | `Test SDF Network ; September 2015` | `Public Global Stellar Network ; September 2015` |
+| API credentials | Testnet-only key | Production key issued after go-live review |
+| Webhook signing secret | Testnet-only secret | Production secret, rotated on schedule |
+
+Rules:
+
+- Never reuse a testnet key or webhook secret in production, and never point a
+  production key at a testnet endpoint (or vice versa). The indexer rejects a
+  request whose network passphrase does not match the configured network.
+- Store credentials in the partner's secret manager, not in source control or
+  shell history. Rotate the webhook secret on the schedule in `SECURITY.md`.
+
+### Step 1 — Configure credentials (testnet)
+
+```bash
+# Testnet only. Do not reuse these values in production.
+export PARTNER_API_BASE="https://api.testnet.example.com"
+export PARTNER_API_KEY="$(secret-tool lookup service partner env testnet)"
+export PARTNER_WEBHOOK_SECRET="$(secret-tool lookup service partner-webhook env testnet)"
+
+# Verify the key is accepted and the network matches.
+curl -fsS "$PARTNER_API_BASE/v1/health" \
+  -H "Authorization: Bearer $PARTNER_API_KEY" | jq '{network, status}'
+# Expected: {"network":"testnet","status":"ok"}
+```
+
+Failure cases to confirm before continuing:
+
+- A missing or empty `PARTNER_API_KEY` returns `401`.
+- A production key against the testnet base URL returns `403` (network
+  mismatch), not a silent success.
+
+### Step 2 — Validate webhook handling
+
+Register a testnet webhook endpoint, then verify signature handling with a
+runnable sample. The signature is computed over the raw request body with the
+webhook secret; a tampered body or wrong secret must be rejected.
+
+```bash
+# Send a signed testnet webhook to your own handler.
+BODY='{"event":"stream.created","stream_id":"test-1"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$PARTNER_WEBHOOK_SECRET" -hex | awk '{print $2}')
+
+curl -fsS -X POST "https://partner.example.com/webhooks/indexer" \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: sha256=$SIG" \
+  --data "$BODY"
+```
+
+Your handler must:
+
+- Recompute the HMAC over the **raw** body and compare in constant time.
+- Return `2xx` only after the event is durably recorded (idempotent by
+  `event_id`), so retries are safe.
+- Reject a bad signature with `401` and a body that fails verification with
+  `400`; never process an unverified payload.
+
+Failure cases to confirm:
+
+- A wrong `PARTNER_WEBHOOK_SECRET` yields `401` and no side effects.
+- A body modified after signing yields `401`.
+- A replayed `event_id` is acknowledged but not processed twice.
+
+### Step 3 — Test reconciliation
+
+Reconcile your records against the indexer's stream/event history for a known
+ledger range, then confirm the cursor advanced monotonically.
+
+```bash
+# Pull events for a known testnet ledger range and compare counts.
+curl -fsS "$PARTNER_API_BASE/v1/events?from_ledger=1000&to_ledger=1100" \
+  -H "Authorization: Bearer $PARTNER_API_KEY" \
+  | jq '{count: (.events | length), last_ledger: .cursor}'
+```
+
+- Totals must match your own ledger of record for the same range; a mismatch
+  is a reconciliation failure and blocks go-live.
+- Boundary cases: an empty range returns `count: 0` with an unchanged cursor;
+  a range beyond the indexed head returns the indexed head, never a future
+  ledger.
+
+### Step 4 — Clean-environment validation (required before publication)
+
+Before requesting production credentials, run the full flow above in a **fresh
+environment** with no cached state, using only testnet credentials:
+
+1. Provision a clean host/container with no prior config.
+2. Set only the testnet variables from Step 1.
+3. Run Steps 1–3 end to end and record the outputs.
+4. Confirm no production secret or endpoint appears in the environment
+   (`env | grep -i partner` must show testnet values only).
+
+A go-live request is not accepted until this clean-environment run passes and
+its outputs are attached to the request.
+
+### Step 5 — Go-live checklist
+
+- [ ] Clean-environment validation (Step 4) passed and outputs attached.
+- [ ] Production credentials issued and stored in the secret manager.
+- [ ] Production webhook secret set and rotation schedule recorded.
+- [ ] Webhook handler verifies signatures and is idempotent by `event_id`.
+- [ ] Reconciliation matches for a known production ledger range.
+- [ ] Network passphrase and RPC endpoint confirmed as mainnet.
+- [ ] No testnet key, secret, or endpoint present in production config.
+- [ ] On-call contact and rollback plan documented.
 
 ---
 
@@ -172,76 +329,107 @@ backend instances**.
 
 ---
 
-## 4. Production-scale query regression suite
+## 4. Ledger-consistent multi-resource snapshots
 
-To catch performance regressions before release, the backend ships an
-**opt-in** query regression suite that runs representative stream, event,
-export, and analytics queries against a realistic data volume. It is **not**
-part of the default fast test run; it is scheduled in CI (nightly) and can be
-run on demand.
+### Contract
 
-### Running the suite
+The snapshot endpoint returns related **stream**, **event**, and **balance**
+data tied to a single indexed ledger checkpoint, so clients never have to
+stitch together results read at different ledger heights.
 
-```bash
-# On demand (requires a reachable PostgreSQL instance)
-QUERY_REGRESSION=1 npm run test:query-regression
-```
+- **Single checkpoint.** All resources in a response are read at the same
+  indexed ledger. The response echoes that ledger as `ledger`.
+- **Staleness metadata.** The response includes `indexerLag` (current chain
+  head minus the snapshot ledger) and `stale` (whether the snapshot is older
+  than the configured freshness threshold).
+- **No checkpoint yet.** If the indexer has not yet indexed any ledger, the
+  endpoint returns a `409`-style "no checkpoint" result rather than an empty
+  snapshot; clients should retry after the indexer catches up.
 
-- The suite is skipped unless `QUERY_REGRESSION=1` is set, so the default
-  `npm test` run stays fast and hermetic.
-- It seeds a **deterministic** dataset (fixed seed) sized to production-like
-  volume, then runs each recorded query plan and compares measured latency
-  against the recorded baseline.
+### Response fields
 
-### Recorded dataset and query plans
+| Field | Description |
+| --- | --- |
+| `ledger` | The indexed ledger checkpoint the snapshot was read at |
+| `indexerLag` | Ledgers between the chain head and `ledger` (0 when caught up) |
+| `stale` | `true` when `indexerLag` exceeds the freshness threshold |
+| `streams` | Stream records as of `ledger` |
+| `events` | Event records as of `ledger` |
+| `balances` | Balance records as of `ledger` |
 
-The fixtures live alongside the suite and record, for each hot path:
+### Client retry semantics
 
-| Fixture | Query | Baseline plan |
-| --- | --- | --- |
-| `stream-list` | Keyset-paginated stream list | Index scan on `streams_created_at_id_idx` |
-| `wallet-history` | Per-wallet stream history | Index scan on `streams_sender_idx` |
-| `stream-events` | Per-stream event history | Index scan on `events_stream_id_ledger_idx` |
-| `cursor-scan` | Ledger range / cursor scan | Index scan on `events_ledger_idx` |
-| `export` | Stream/event export range | Index scan on `events_ledger_idx` |
-| `analytics-by-type` | Event counts grouped by type | Index scan on `events_type_ledger_idx` |
+When the indexer is lagging, clients **must retry** rather than combine
+results from different ledgers:
 
-Each fixture records the expected plan shape (e.g. no sequential scan, no
-sort node where an index provides ordering) and a latency baseline captured on
-the reference dataset.
+- If `stale` is `true`, treat the snapshot as advisory and retry with backoff
+  until a fresher snapshot is available; do **not** merge it with data from
+  another request.
+- If the endpoint reports no checkpoint yet, retry after a short delay.
+- A snapshot is internally consistent by construction; combining resources
+  across two snapshot responses read at different `ledger` values is not
+  supported and can produce inconsistent views.
 
-### Regression thresholds
+### Boundary cases
 
-- **Latency:** a query fails the suite if its measured latency exceeds the
-  recorded baseline by more than the bounded threshold (default **2×** the
-  baseline, with a small absolute floor to avoid noise on sub-millisecond
-  queries).
-- **Plan shape:** a query fails if it regresses from an index scan to a
-  sequential scan, or if an unexpected sort node appears on an ordered path.
-- **Boundary cases:** the suite also covers an empty/minimal dataset (queries
-  must succeed and stay within the absolute floor) and a dataset exactly at
-  the threshold (must pass) versus just over it (must fail), so the threshold
-  logic itself is covered.
-
-Thresholds are bounded and recorded with the fixtures; raising a baseline is
-an explicit, reviewable change rather than an implicit drift.
+- **Zero lag:** `indexerLag` is `0` and `stale` is `false` when the indexer is
+  caught up to the chain head.
+- **Large lag:** `indexerLag` grows with the gap; `stale` flips to `true` once
+  the threshold is exceeded.
+- **No checkpoint:** the endpoint signals retry instead of returning partial
+  data.
 
 ---
 
 ## 5. Soroban RPC retry and backoff
 
-*(See the RPC client module for the retry/backoff policy; configuration keys
-are additive and documented alongside the client.)*
+### Behavior
+
+Soroban RPC calls are retried with bounded exponential backoff and jitter.
+
+- **Retryable errors.** Transient transport failures, timeouts, and rate-limit
+  responses are retried. Deterministic errors (invalid arguments, not found)
+  are not retried.
+- **Bounded attempts.** Each call has a maximum attempt count and a cap on the
+  backoff delay; jitter avoids synchronized retry storms across replicas.
+- **Cursor safety.** A failed poll does not advance the cursor; the next poll
+  resumes from the last successfully applied ledger.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `SOROBAN_RPC_MAX_ATTEMPTS` | Maximum attempts per call | Includes the first attempt |
+| `SOROBAN_RPC_BASE_BACKOFF_MS` | Base backoff delay | Grows exponentially per attempt |
+| `SOROBAN_RPC_MAX_BACKOFF_MS` | Backoff cap | Upper bound after jitter |
 
 ---
 
 ## 6. Graceful shutdown and poll cancellation
 
-*(See the worker module for shutdown and poll cancellation behavior.)*
+### Behavior
+
+On shutdown the indexer stops accepting new work, cancels any in-flight poll,
+and releases the lease so another replica can take over promptly.
+
+- **Cancellation.** An in-flight poll observes the shutdown signal and aborts
+  before advancing the cursor; partially applied work is not committed.
+- **Lease release.** The lease is released on shutdown so takeover latency is
+  not bounded by the TTL.
+- **Idempotent restart.** Because the cursor only advances on committed work,
+  a restart resumes from the last applied ledger without duplication.
 
 ---
 
-## 7. Indexer metrics
+## 7. Metrics
 
-*(See the metrics module for the full metric list, including lease
-acquisition, renewal failures, and rejected stale writes.)*
+| Metric | Meaning |
+| --- | --- |
+| `indexer_lease_acquired_total` | Successful lease acquisitions |
+| `indexer_lease_renewed_total` | Successful lease renewals |
+| `indexer_lease_lost_total` | Lease losses (expiry or renewal failure) |
+| `indexer_fenced_write_rejected_total` | Cursor writes rejected by fencing |
+| `indexer_poll_duration_ms` | Poll duration histogram |
+| `indexer_cursor_ledger` | Current indexed ledger |
+| `indexer_lag_ledgers` | Chain head minus indexed ledger |
+| `indexer_snapshot_stale_total` | Snapshots served while stale |
