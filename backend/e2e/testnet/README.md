@@ -49,38 +49,51 @@ tests are skipped when `DATABASE_URL` is unset.
 | `E2E_TX_TIMEOUT_MS` | `90000` |
 | `E2E_INDEXER_TIMEOUT_MS` | `120000` |
 
-## Multi-network registry and pinning
+## Supported compatibility matrix
 
-The SDK ships a versioned registry of supported networks (endpoints, network
-passphrase, and deployment identifiers such as the stream contract ID). The E2E
-suite resolves its defaults from this registry, so the values above are the
-registry defaults for `testnet`.
+This matrix defines the tested boundaries for wallet and transaction
+workflows. Each entry is tied to concrete evidence so contributors can tell
+what is actually verified versus assumed. Anything not listed here is
+**unsupported** and must be treated as best-effort.
 
-Operators can **pin** approved registry values so runtime resolution uses the
-pinned entries instead of the shipped defaults. Pinning is how you lock a
-network to a reviewed contract ID and passphrase without editing code:
+### Browsers
 
-- Each registry entry carries a `version`, the network `passphrase`, and the
-deployment `contractId`.
-- On load, the registry validates that the passphrase matches the expected
-  network identity and that the contract ID is a well-formed Stellar contract
-  address. Entries that fail validation are rejected.
-- A pinned entry whose passphrase or contract ID differs from the shipped
-  registry entry is treated as a **changed entry** and flagged rather than
-  silently accepted. Unknown networks (not present in the registry) are
-  rejected.
+| Browser | Minimum version | Evidence |
+| --- | --- | --- |
+| Chrome / Edge (Chromium) | last 2 stable majors | Manual: wallet connect + `create_stream`/`withdraw`/`cancel_stream` on Testnet per release checklist |
+| Firefox | last 2 stable majors | Manual: same release checklist |
+| Safari | last 2 stable majors | Manual: same release checklist |
+| Mobile browsers | _unsupported_ | — |
 
-### Trust and update policy
+Boundary rule: a browser one major below the minimum is **unsupported**; the
+release checklist must record the exact versions exercised so the matrix stays
+current.
 
-- The shipped registry is the source of truth for defaults; treat it as
-  reviewed code and change it only through a PR that bumps the entry `version`.
-- Pins are operator-owned overrides. When a shipped entry changes, a pin that
-  no longer matches is surfaced as a changed entry so operators re-review and
-  re-pin deliberately — never auto-followed.
-- Never pin a passphrase or contract ID you have not verified against the
-  target network; a mismatched passphrase will fail validation and a mismatched
-  contract ID will be flagged as changed.
+### Wallets
 
-When running the E2E suite against a pinned deployment, set
-`E2E_STREAM_CONTRACT_ID` and `E2E_NETWORK_PASSPHRASE` to the pinned values; the
-suite validates them the same way the registry does before running.
+| Wallet | Status | Evidence |
+| --- | --- | --- |
+| Freighter | Supported | Manual: connect + sign `create_stream`/`withdraw`/`cancel_stream` on Testnet |
+| WalletConnect-based wallets | Supported | Manual: connect + sign on Testnet |
+| Hardware wallets | _unsupported_ | — |
+| Custodial / exchange wallets | _unsupported_ | — |
+
+### Networks
+
+| Network | Status | Evidence |
+| --- | --- | --- |
+| Stellar Testnet | Supported | Automated: `network-health.e2e.test.ts`, `stream-lifecycle.e2e.test.ts` (scheduled every 6h) |
+| Stellar Mainnet | Supported (manual sign-off) | Manual: release checklist transaction on Mainnet |
+| Futurenet / custom networks | _unsupported_ | — |
+
+### Communicating unsupported combinations
+
+- **Users:** the app must surface an explicit, non-blocking message naming the
+  unsupported browser, wallet, or network and refuse to submit the transaction
+  rather than silently failing. Wallet authorization and chain/network
+  validation must never be bypassed to make an unsupported combination work.
+- **Contributors:** any change that widens or narrows this matrix must update
+  this table and its evidence in the same PR. A combination without an evidence
+  entry is unsupported by default.
+- **Failures:** a scheduled `testnet-e2e-failure` issue means the Testnet row
+  is no longer verified; treat Testnet as degraded until the run is green.

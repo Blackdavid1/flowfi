@@ -69,5 +69,76 @@ Identifiers are never regenerated from timestamps or array positions.
 
 ## Compatibility
 
-Existing export interfaces remain backward compatible. Any breaking change to
-the interchange format must be versioned via the batch header `schemaVersion`.
+```bash
+npm run prisma:seed
+```
+
+(this runs `prisma db seed`, which in turn runs `tsx prisma/seed.ts` as configured under the `prisma.seed` key in `package.json`.)
+
+The script is idempotent (it uses `upsert`/fixed IDs), so it's safe to run multiple times. It creates:
+
+- Two demo users, keyed by fixed Stellar testnet public keys — a sender (`GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTAYXE75AFN`) and a recipient (`GBJCHUKZMTFSLOMNC7P4TS4VJJBTCYL3XKSOLXAUJSD56C4LHND5TWUC`).
+- One demo `Stream` (`streamId: 101`) between those two users, using a fixed demo token address, with a sample rate/deposit amount and `isActive: true`.
+- One demo `StreamEvent` (`eventType: 'CREATED'`) attached to that stream, with sample transaction hash, ledger sequence, and metadata.
+
+These fixtures are intended purely for local development/demo purposes so the frontend has data to render out of the box; they are not used in automated tests.
+
+### Troubleshooting
+
+If a `prisma generate` / `prisma migrate` command misbehaves, check `prisma.config.ts` before assuming the schema is at fault:
+
+- **"Environment variable not found: DATABASE_URL"** or the CLI connecting to the wrong database — the config resolves `DATABASE_URL` at load time via `dotenv/config`, so it reads `backend/.env`. A variable exported only in your shell after the process starts, or set in a `.env` outside `backend/`, will not be picked up.
+- **CLI can't find the schema or migrations** — these paths are relative to `backend/`. Running `prisma` from the repo root will not resolve them.
+- **`npm run prisma:seed` not running the seed script** — the seed command is declared in the legacy `prisma.seed` field in `package.json`. Prisma 7 expects it as `migrations.seed` in `prisma.config.ts`, so if seeding silently does nothing, check both places.
+
+## /v1 API
+
+All REST API endpoints are prefixed with `/v1`. Refer to the API Documentation in the root `README.md` and the `docs/` folder for versioning and authentication details.
+
+## Server-Sent Events (SSE)
+
+The backend exposes an SSE endpoint (`/v1/streams/events`) to stream real-time updates to the frontend whenever on-chain stream events are indexed.
+
+### Consuming stream events from the SDK
+
+The SDK ships framework-neutral React hooks for the stream lifecycle so consumers do not have to hand-roll SSE wiring. They are optional — the core SDK has no React dependency, and the hooks live in a separate entry point that only imports React when you use them.
+
+- `useStreamState(streamId, { walletAddress })` — loads the current stream state and subscribes to `/v1/streams/events` for updates. It refetches when `streamId` or `walletAddress` changes, aborts in-flight requests and closes the `EventSource` on unmount or dependency change, and ignores responses that arrive after a newer request or after unmount so stale data never overwrites fresh state.
+- `useStreamEvents(streamId, { walletAddress, onEvent })` — subscribes to updates only, for consumers that already hold state elsewhere.
+
+Both hooks are safe to call during server rendering: they do not open an `EventSource` or issue a fetch until after mount, so SSR output is stable and hydration does not mismatch.
+
+```tsx
+import { useStreamState } from '@flowfi/sdk/react';
+
+function StreamBalance({ streamId, walletAddress }: { streamId: string; walletAddress: string }) {
+  const { data, error, isLoading } = useStreamState(streamId, { walletAddress });
+  if (isLoading) return <span>Loading…</span>;
+  if (error) return <span>Failed to load stream</span>;
+  return <span>{data?.remainingAmount}</span>;
+}
+```
+
+## Indexer Startup Preflight
+
+Before the Soroban event worker begins polling, the indexer runs a preflight that validates the configured deployment identity. If any check fails, the worker does not start and no cursor or stream state is read or written — the process fails fast with an actionable diagnostic instead of indexing the wrong deployment.
+
+The preflight verifies, in order:
+
+1. **Network** — `STELLAR_NETWORK` / `NETWORK_PASSPHRASE` is present, well-formed, and matches the network the RPC endpoint reports. A missing, malformed, or mismatched network aborts startup.
+2. **Contract ID** — `STREAM_CONTRACT_ID` is present, is a valid Stellar contract address (`C...`), and corresponds to the expected deployment for the configured network. A missing, malformed, or mismatched contract ID aborts startup.
+3. **RPC availability** — the configured `SOROBAN_RPC_URL` (and any `SOROBAN_RPC_URLS` failover endpoints) is reachable and responds to a health probe. An unreachable RPC aborts startup with the failing endpoint in the message.
+4. **Contract interface compatibility** — the deployed contract exposes the methods and events the indexer expects. A missing or incompatible interface aborts startup.
+
+Each failure is reported with the specific check that failed and the offending value, so operators can correct configuration without inspecting logs. Because preflight runs before the worker touches the database, a failed preflight leaves the indexer cursor and stream state untouched; fixing the configuration and restarting resumes from the previous cursor.
+
+Operational impact: a misconfigured deployment now fails at startup rather than silently indexing the wrong network or contract. No migration is required — existing valid configurations pass preflight unchanged, and the public indexer interfaces are preserved.
+
+## Logging & Correlation IDs
+
+Structured JSON logs generated by Winston (`backend/src/logger.ts`) attach a `requestId` correlation ID via `AsyncLocalStorage` (`requestContext`):
+- **HTTP Requests:** Set via `requestIdMiddleware` (`X-Request-ID` header or auto-generated UUID).
+- **Worker Poll Batches:** Each poll cycle in `SorobanEventWorker` runs in `requestContext.run({ requestId: randomUUID() }, ...)` so all event logs and error traces share a single ID per cycle.
+- **Admin Replays:** Replays triggered via `repl
+
+/* … truncated 174 chars — edit only what you need near the top … */

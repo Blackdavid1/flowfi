@@ -13,6 +13,71 @@ Authentication is performed in two phases:
 
 This simplifies clients and standardizes authentication across all protected routes.
 
+## Partner Onboarding: Credentials, Webhooks, and Go-Live
+
+External partners integrate in two isolated environments. **Testnet and production never share credentials, endpoints, or secrets.** Complete and validate the testnet path end-to-end before requesting production access.
+
+### 1. Configure credentials (per environment)
+
+Each environment has its own values. Never copy a testnet secret into production or vice versa.
+
+| Setting | Testnet | Production |
+| --- | --- | --- |
+| API base URL | `https://api.testnet.flowfi.example` | `https://api.flowfi.example` |
+| Stellar network passphrase | `Test SDF Network ; September 2015` | `Public Global Stellar Network ; September 2015` |
+| `AUTH_AUDIENCE` | `flowfi-testnet` | `flowfi-production` |
+| Partner API key | issued per testnet app | issued per production app (separate) |
+| Webhook signing secret | testnet-only secret | production-only secret |
+
+Store secrets in your secret manager, never in source control. The server only ever sees your Stellar **public** key and signed challenges — it never receives your secret key.
+
+### 2. Validate webhook handling
+
+Webhooks are signed. Verify the signature against the **environment-specific** signing secret before trusting the payload, and reject on mismatch.
+
+```bash
+# Runnable testnet sample: send a signed test event to your handler
+curl -X POST "$PARTNER_WEBHOOK_URL" \
+  -H "Content-Type: application/json" \
+  -H "X-FlowFi-Signature: $(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/^.* //')" \
+  -d "$BODY"
+```
+
+Checklist:
+
+- [ ] Handler rejects requests with a missing or invalid `X-FlowFi-Signature` (expect `401`).
+- [ ] Handler rejects a payload signed with the *other* environment's secret (testnet/production mismatch).
+- [ ] Handler is idempotent on duplicate delivery (dedupe by event id).
+- [ ] Handler returns `2xx` quickly and processes asynchronously.
+
+### 3. Test reconciliation
+
+Reconciliation confirms your ledger matches FlowFi's reported state.
+
+```bash
+# Runnable testnet sample: fetch settled transactions for a window
+curl -X GET "$API_BASE_URL/v1/transactions?from=$FROM&to=$TO" \
+  -H "Authorization: Bearer $JWT"
+```
+
+Checklist:
+
+- [ ] Sum of your recorded amounts equals the API-reported totals for the window.
+- [ ] Boundary cases pass: empty window, single transaction, and a window spanning a settlement cutoff.
+- [ ] A deliberately mismatched record is detected and surfaced, not silently dropped.
+
+### 4. Clean-environment validation before go-live
+
+Before publication/production access, run the full flow from a **clean environment** (fresh credentials, empty state, no cached tokens):
+
+1. Request a challenge, sign it, and exchange it for a JWT (see [Wallet Challenges](#wallet-challenges-single-use-replay-resistant)).
+2. Confirm a reused challenge is rejected with `401 CHALLENGE_ALREADY_USED`.
+3. Confirm a challenge signed for the wrong network is rejected with `401 CHALLENGE_NETWORK_MISMATCH`.
+4. Deliver a signed webhook and confirm acceptance; deliver a bad-signature webhook and confirm rejection.
+5. Run reconciliation and confirm totals match.
+
+Only after every step passes on testnet should you request production credentials and repeat steps 1–5 against production with production-only secrets.
+
 ## Using the Middleware
 
 ### Protected Routes
@@ -91,63 +156,6 @@ Challenges issued by `/v1/auth/challenge` are **single-use** and bound to a spec
 - Clients that previously reused a signed challenge (or cached a nonce across requests) **must** request a fresh challenge for every login. Reuse now returns `401 CHALLENGE_ALREADY_USED`.
 - Clients must send the same `network` and `audience` they used when requesting the challenge; mismatches are rejected.
 - If `AUTH_CHALLENGE_TTL_SECONDS` is lowered, clients should request and submit challenges promptly rather than pre-generating them.
-
-## Server-Side Signing Boundary
-
-FlowFi is **non-custodial by default**. The SDK never holds user secret keys, and signing is confined to a server-only boundary module that is excluded from browser bundles.
-
-### Non-Custodial Defaults
-
-- Client code signs transactions locally with the user's wallet; the server only verifies signatures.
-- No secret keys, seeds, or signing material are ever shipped to or accepted from the browser.
-- Custodial signing is **disabled** unless an application explicitly supplies a signer policy that authorizes it.
-
-### Signer Policy Interface
-
-Applications that need custodial signing supply a `SignerPolicy` on the server. The policy is consulted for every signing request and must return an explicit decision:
-
-```typescript
-interface SignerPolicy {
-  // Return true to authorize signing this action, false to deny.
-  authorize(request: SigningRequest): Promise<boolean> | boolean;
-}
-```
-
-- The default policy **denies all custodial signing** (`denyAllSignerPolicy`).
-- A denied action fails closed with `403 SIGNING_DENIED`; no signature is produced.
-- The policy is evaluated server-side only; it is never bundled into client code.
-
-### Policy Audit Records
-
-Every signing decision (allowed or denied) emits an audit record containing the action, wallet, network, decision, and reason. Audit records are **redacted**: secret keys, seeds, tokens, and credentials are stripped before the record is written to logs or storage.
-
-### Secret Redaction
-
-Signing errors and audit records never include raw secret material. Redaction is applied to error messages and log output so that keys, tokens, and credentials cannot leak through failure paths.
-
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
-3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
-4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-5. **Network Validation**: Ensures transactions match the configured Stellar network
-6. **No Password Storage**: No sensitive credentials stored on the server
-7. **Server-Side Signing Boundary**: Custodial signing is isolated server-side, policy-gated, and denied by default
-
-## Endpoint-Specific Wallet Authorization Scopes
-
-Authenticated endpoints enforce ownership at the route/service boundary. The server derives the acting wallet from the verified JWT and **never trusts client-supplied sender or recipient addresses** for authorization decisions.
-
-| Resource | Read | Mutate |
-| --- | --- | --- |
-| User profile (`/v1/users/:publicKey`) | Owner wallet only | Owner wallet only |
-| Streams (`/v1/streams/:id`) | Sender or recipient wallet | Sender wallet only |
-| Admin (`/v1/admin/*`) | Admin wallet (allowlisted) | Admin wallet (allowlisted) |
-| Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
-| Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
-
-Violations return `403 WALLET_SCOPE_FORBIDDEN` without revealing whether the resource exists.
 
 ## Error Responses
 
@@ -249,4 +257,35 @@ Unexpected failures return a generic message with no stack trace or internal ide
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
 - New `details` arrays appear only on `400 VALIDATION_ERROR` responses.
 - `requestId` is additive; clients may log it for support escalation.
-- Custodial signing now requires an explicit server-side signer policy; without one, signing requests fail with `403 SIGNING_DENIED`.
+
+## Security Features
+
+1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
+2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
+3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
+4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
+5. **Network Validation**: Ensures transactions match the configured Stellar network
+6. **No Password Storage**: No sensitive credentials stored on the server
+
+## Endpoint-Specific Wallet Authorization Scopes
+
+Authenticated endpoints enforce ownership at the route/service boundary. The server derives the acting wallet from the verified JWT and **never trusts client-supplied sender or recipient addresses** for authorization decisions.
+
+| Resource | Read | Mutate |
+| --- | --- | --- |
+| User profile (`/v1/users/:publicKey`) | Owner wallet only | Owner wallet only |
+| Streams (`/v1/streams/:id`) | Sender or recipient wallet | Sender wallet only |
+| Admin (`/v1/admin/*`) | Admin wallet (allowlisted) | Admin wallet (allowlisted) |
+| Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
+| Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
+
+Violations return `403 WALLET_SCOPE_FORBIDDEN` (see above). Authorization is always evaluated against the JWT-derived wallet, so a caller cannot escalate by spoofing another address in the request body or query string.
+
+## Organization & Recurring-Payment Authorization (ADR Reference)
+
+Shared accounts (organizations) and recurring payment schedules introduce delegated authority. The authorization model for these capabilities is documented in the architecture decision records and must not weaken the wallet guarantees above:
+
+- **Organization model** — see `backend/docs/adr/0001-organization-model.md`. Org membership and roles are off-chain (Prisma) state; the acting wallet is still authenticated via SEP-10 + JWT, and org-scoped routes resolve the caller's role from the JWT-derived wallet. A wallet may only act within an org it is a member of.
+- **Recurring-payment model** — see `backend/docs/adr/0002-recurring-payment-model.md`. Schedule execution authority is delegated by an explicit, wallet-signed authorization; the backend executor can only submit transfers the delegating wallet authorized, and every execution is validated against the configured chain/network before submission.
+
+In both cases the invariants hold: the JWT-derived wallet is the sole identity source, chain/network validation is never bypassed, and no endpoint accepts a client-supplied sender address as proof of authority.
