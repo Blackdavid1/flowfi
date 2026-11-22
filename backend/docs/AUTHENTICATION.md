@@ -263,9 +263,11 @@ Unexpected failures return a generic message with no stack trace or internal ide
 1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
 2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
 3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
-4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-5. **Network Validation**: Ensures transactions match the configured Stellar network
-6. **No Password Storage**: No sensitive credentials stored on the server
+4. **Single-Use Permits**: Signed action permits are consumed on first successful use; replays are rejected
+5. **Permit Binding**: Permits are bound to wallet, network, contract, scope, expiry, and revocation state
+6. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
+7. **Network Validation**: Ensures transactions match the configured Stellar network
+8. **No Password Storage**: No sensitive credentials stored on the server
 
 ## Endpoint-Specific Wallet Authorization Scopes
 
