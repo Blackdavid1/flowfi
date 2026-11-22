@@ -303,4 +303,9 @@ Environment files (import alongside the collection):
 
 `GET /events/subscribe` streams `text/event-stream` data and keeps the connection open. Postman bu
 
-/* … truncated 8349 chars — edit only what you need near the top … */
+MIT.
+
+## Handsoff notes
+
+<!-- handsoff-issue-213 -->
+- #213: feat(contracts): allow third-party contributions to funded streams

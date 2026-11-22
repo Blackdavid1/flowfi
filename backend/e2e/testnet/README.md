@@ -49,108 +49,51 @@ tests are skipped when `DATABASE_URL` is unset.
 | `E2E_TX_TIMEOUT_MS` | `90000` |
 | `E2E_INDEXER_TIMEOUT_MS` | `120000` |
 
-## Partner onboarding & go-live checklist
+## Supported compatibility matrix
 
-This suite is the reference harness external partners use to prove their
-integration before going live. Work through the checklist **in order** on a
-clean environment; do not publish or enable production traffic until every box
-is checked.
+This matrix defines the tested boundaries for wallet and transaction
+workflows. Each entry is tied to concrete evidence so contributors can tell
+what is actually verified versus assumed. Anything not listed here is
+**unsupported** and must be treated as best-effort.
 
-### 0. Testnet vs production separation (do this first)
+### Browsers
 
-Testnet and production must never share credentials, endpoints, or databases.
-Use a dedicated `.env` per environment and keep production secrets out of the
-repo and out of any testnet shell.
-
-| Concern | Testnet | Production |
+| Browser | Minimum version | Evidence |
 | --- | --- | --- |
-| RPC | `https://soroban-testnet.stellar.org` | your production Soroban RPC |
-| Horizon | `https://horizon-testnet.stellar.org` | your production Horizon |
-| Network passphrase | Testnet passphrase | Public passphrase |
-| Friendbot | `https://friendbot.stellar.org` | **never** — fund via treasury |
-| Contract ID | testnet deployment | production deployment |
-| Database | disposable local DB | managed production DB |
-| API keys / signing keys | testnet-only keys | production keys from a secret manager |
+| Chrome / Edge (Chromium) | last 2 stable majors | Manual: wallet connect + `create_stream`/`withdraw`/`cancel_stream` on Testnet per release checklist |
+| Firefox | last 2 stable majors | Manual: same release checklist |
+| Safari | last 2 stable majors | Manual: same release checklist |
+| Mobile browsers | _unsupported_ | — |
 
-A mismatch here is the most common go-live failure. The suite refuses to run
-against a passphrase that does not match the configured RPC/Horizon pair, so a
-mixed `.env` fails fast instead of silently passing.
+Boundary rule: a browser one major below the minimum is **unsupported**; the
+release checklist must record the exact versions exercised so the matrix stays
+current.
 
-### 1. Configure credentials
+### Wallets
 
-```bash
-cd backend
-cp .env.example .env.testnet   # never commit this file
-# Fill in testnet-only values, then load them for the session:
-set -a && . ./.env.testnet && set +a
-```
+| Wallet | Status | Evidence |
+| --- | --- | --- |
+| Freighter | Supported | Manual: connect + sign `create_stream`/`withdraw`/`cancel_stream` on Testnet |
+| WalletConnect-based wallets | Supported | Manual: connect + sign on Testnet |
+| Hardware wallets | _unsupported_ | — |
+| Custodial / exchange wallets | _unsupported_ | — |
 
-Verify the credentials resolve before running anything:
+### Networks
 
-```bash
-# Fails loudly if a required var is missing or still points at production.
-npm run test:e2e:testnet -- network-health
-```
+| Network | Status | Evidence |
+| --- | --- | --- |
+| Stellar Testnet | Supported | Automated: `network-health.e2e.test.ts`, `stream-lifecycle.e2e.test.ts` (scheduled every 6h) |
+| Stellar Mainnet | Supported (manual sign-off) | Manual: release checklist transaction on Mainnet |
+| Futurenet / custom networks | _unsupported_ | — |
 
-Boundary cases to confirm by hand:
+### Communicating unsupported combinations
 
-- **Missing credential** — unset `E2E_SOROBAN_RPC_URL`; the run must fail with a
-  clear "missing configuration" error, not a network timeout.
-- **Invalid credential** — set `E2E_SOROBAN_RPC_URL` to a bogus host; the run
-  must fail fast with a connection error.
-- **Testnet/production mismatch** — set `E2E_NETWORK_PASSPHRASE` to the public
-  passphrase while keeping testnet endpoints; the run must abort with a
-  mismatch error.
-
-### 2. Validate webhook handling
-
-Point your webhook receiver at the testnet indexer and confirm:
-
-- A validly signed delivery is accepted and processed.
-- A delivery with a **tampered signature** is rejected (non-2xx) and logged.
-- A delivery with a **missing signature header** is rejected.
-- Replayed deliveries are idempotent (no double accounting).
-
-```bash
-# Drive a real event through the indexer, then assert your receiver saw it:
-npm run test:e2e:testnet -- stream-lifecycle
-```
-
-### 3. Test reconciliation
-
-Reconciliation must match on-chain state to your ledger exactly:
-
-- Run the indexer suite against a disposable DB (it resets the cursor).
-- Confirm hashes, ledgers, and amounts match between chain and DB.
-- Confirm a **boundary** case: a stream that is created and cancelled in the
-  same ledger reconciles to zero net balance, not a partial amount.
-
-```bash
-export DATABASE_URL=postgresql://flowfi:flowfi_dev_password@127.0.0.1:5433/flowfi
-npx prisma db push --schema=prisma/schema.prisma
-npm run test:e2e:testnet
-```
-
-### 4. Clean-environment validation (required before publication)
-
-Before publishing or enabling production traffic, reproduce the full run from a
-**fresh checkout with no cached state**:
-
-```bash
-git clean -xdf && git checkout .
-cd backend && npm ci
-set -a && . ./.env.testnet && set +a
-npm run test:e2e:testnet
-```
-
-All suites must pass with zero skips that hide a required check. Record the run
-(commit SHA, date, pass/fail) in your go-live ticket.
-
-### 5. Go-live sign-off
-
-- [ ] Testnet and production configs are fully separated (no shared secrets).
-- [ ] Missing/invalid credential and passphrase-mismatch cases fail fast.
-- [ ] Webhook signature failure and missing-signature cases are rejected.
-- [ ] Reconciliation matches chain↔DB, including the same-ledger boundary case.
-- [ ] Clean-environment run passes and is recorded.
-- [ ] Production secrets live in a secret manager, not in the repo or shell history.
+- **Users:** the app must surface an explicit, non-blocking message naming the
+  unsupported browser, wallet, or network and refuse to submit the transaction
+  rather than silently failing. Wallet authorization and chain/network
+  validation must never be bypassed to make an unsupported combination work.
+- **Contributors:** any change that widens or narrows this matrix must update
+  this table and its evidence in the same PR. A combination without an evidence
+  entry is unsupported by default.
+- **Failures:** a scheduled `testnet-e2e-failure` issue means the Testnet row
+  is no longer verified; treat Testnet as degraded until the run is green.

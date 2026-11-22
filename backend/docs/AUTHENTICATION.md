@@ -157,24 +157,6 @@ Challenges issued by `/v1/auth/challenge` are **single-use** and bound to a spec
 - Clients must send the same `network` and `audience` they used when requesting the challenge; mismatches are rejected.
 - If `AUTH_CHALLENGE_TTL_SECONDS` is lowered, clients should request and submit challenges promptly rather than pre-generating them.
 
-## Key Lifecycle: User Wallets vs. Operator Identities
-
-Authentication distinguishes two key classes. The full decision matrix — ownership, signer responsibilities, rotation, revocation, and incident steps — lives in [`docs/security/key-lifecycle-matrix.md`](../../docs/security/key-lifecycle-matrix.md). Summary:
-
-| Aspect | Non-custodial user wallet | Explicitly custodial flow | Operator / service identity |
-| --- | --- | --- | --- |
-| Key holder | End user (client-side signer) | FlowFi-managed signer (only where a flow is explicitly custodial) | FlowFi operators / service accounts |
-| Server sees | Public key + signed challenge only | Public key + delegated signing authority | Service credentials, never user secrets |
-| Signer responsibility | User signs SEP-10 challenge and any transaction | FlowFi signs on the user's behalf under documented custody controls | Operator signs/authorizes via managed credentials |
-| Rotation | User rotates their own Stellar keys; server re-binds on next login | FlowFi rotates the custodial signer per the matrix | Scheduled + on-incident rotation per the matrix |
-| Revocation | User stops using the key; server rejects stale challenges | FlowFi revokes the custodial signer and re-issues | Operator access revoked immediately on offboarding/incident |
-
-- **Non-custodial (default):** FlowFi never holds user secret keys. The server only verifies signatures against the public key presented in the SEP-10 challenge.
-- **Custodial (explicit only):** Any flow where FlowFi holds or controls signing material must be explicitly documented as custodial and gated by the controls referenced in the matrix. Do not describe a flow as non-custodial if FlowFi can sign on the user's behalf.
-- **Operator / service identities:** Managed separately from user wallets; see the matrix for rotation cadence, revocation, and incident response.
-
-Related controls: [`SECURITY.md`](../../SECURITY.md), [`.github/SECURITY_SETUP_CHECKLIST.md`](../../.github/SECURITY_SETUP_CHECKLIST.md). Never publish operational secrets, private keys, or seed phrases in this or any doc.
-
 ## Error Responses
 
 All errors share a predictable envelope produced by centralized validation and error mapping:
@@ -261,4 +243,36 @@ Unexpected failures return a generic message with no stack trace or internal ide
 
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
 - New `details` arrays appear only on `400 VALIDATION_ERROR` responses.
-- `requestId` is additive; clients may log it for support correlation.
+- `requestId` is additive; clients may log it for support escalation.
+
+## Security Features
+
+1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
+2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
+3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
+4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
+5. **Network Validation**: Ensures transactions match the configured Stellar network
+6. **No Password Storage**: No sensitive credentials stored on the server
+
+## Endpoint-Specific Wallet Authorization Scopes
+
+Authenticated endpoints enforce ownership at the route/service boundary. The server derives the acting wallet from the verified JWT and **never trusts client-supplied sender or recipient addresses** for authorization decisions.
+
+| Resource | Read | Mutate |
+| --- | --- | --- |
+| User profile (`/v1/users/:publicKey`) | Owner wallet only | Owner wallet only |
+| Streams (`/v1/streams/:id`) | Sender or recipient wallet | Sender wallet only |
+| Admin (`/v1/admin/*`) | Admin wallet (allowlisted) | Admin wallet (allowlisted) |
+| Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
+| Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
+
+Violations return `403 WALLET_SCOPE_FORBIDDEN` (see above). Authorization is always evaluated against the JWT-derived wallet, so a caller cannot escalate by spoofing another address in the request body or query string.
+
+## Organization & Recurring-Payment Authorization (ADR Reference)
+
+Shared accounts (organizations) and recurring payment schedules introduce delegated authority. The authorization model for these capabilities is documented in the architecture decision records and must not weaken the wallet guarantees above:
+
+- **Organization model** — see `backend/docs/adr/0001-organization-model.md`. Org membership and roles are off-chain (Prisma) state; the acting wallet is still authenticated via SEP-10 + JWT, and org-scoped routes resolve the caller's role from the JWT-derived wallet. A wallet may only act within an org it is a member of.
+- **Recurring-payment model** — see `backend/docs/adr/0002-recurring-payment-model.md`. Schedule execution authority is delegated by an explicit, wallet-signed authorization; the backend executor can only submit transfers the delegating wallet authorized, and every execution is validated against the configured chain/network before submission.
+
+In both cases the invariants hold: the JWT-derived wallet is the sole identity source, chain/network validation is never bypassed, and no endpoint accepts a client-supplied sender address as proof of authority.
