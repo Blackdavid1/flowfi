@@ -132,6 +132,13 @@ model IndexerState {
 // signature, and event count the indexer ingested. Written on every ingestion
 // cycle so the worker can (a) prove the canonical chain still contains what it
 // indexed and (b) roll back deterministically when a fork replaces it.
+//
+// Snapshot contract (issue #228): the highest non-reverted ledgerSequence is the
+// single indexed checkpoint that ledger-consistent multi-resource snapshots are
+// pinned to. Stream, event, and balance reads for a snapshot MUST be filtered to
+// ledgerSequence <= that checkpoint so clients never combine data from different
+// ledgers. When the indexer lags behind the chain tip, the snapshot reports
+// staleness metadata and clients should retry rather than merge results.
 model LedgerCheckpoint {
   ledgerSequence Int      @id
   ledgerHash     String
@@ -142,6 +149,7 @@ model LedgerCheckpoint {
   isReverted     Boolean  @default(false)
 
   @@index([processedAt])
+  @@index([isReverted, ledgerSequence])
 }
 
 // StreamEvent model - indexer events for tracking all on-chain stream activities
@@ -171,6 +179,9 @@ model StreamEvent {
   // blockchain-ordered event listings. ledger_sequence is the total order on
   // Stellar — no two events in different ledgers share a sequence number.
   @@index([streamId, ledgerSequence])
+  // Snapshot index (issue #228): supports ledger-bounded event reads for a
+  // single checkpoint (ledgerSequence <= checkpoint) without a full scan.
+  @@index([ledgerSequence])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
