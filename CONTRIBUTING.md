@@ -1,60 +1,32 @@
 # Contributing
 
-Thanks for your interest in contributing! This guide covers the workflow for
-proposing changes, getting them reviewed, and promoting releases between
-environments.
+Thanks for your interest in contributing. This document covers the basics.
 
 ## Getting started
 
-1. Fork the repository and create a topic branch off `main`.
-2. Install dependencies and run the project locally (see the project README).
-3. Make focused changes that address a single issue.
-4. Open a pull request that references the issue it resolves.
+1. Fork the repository and create a topic branch from `main`.
+2. Make focused changes that address a single issue.
+3. Open a pull request describing the change and linking the issue.
 
-## Pull request expectations
+## Code style
 
-- Keep changes scoped to the linked issue. Avoid drive-by refactors.
-- Match existing patterns, naming, and module structure.
-- Include focused automated tests for new behavior, covering failure and
-  boundary cases.
-- Update the owning documentation (API, contract, operational, or contributor)
-  when behavior or interfaces change.
-- Do not weaken wallet authorization, chain/network validation, financial
-  accounting invariants, or secret-handling requirements to make a change pass.
+- Match the existing patterns, naming, and module structure of the files you touch.
+- Keep changes surgical; avoid unrelated refactors or formatting churn.
+- Do not weaken wallet authorization, chain/network validation, financial accounting invariants, or secret-handling requirements.
 
-## Release promotion: deployment manifest review
+## Tests
 
-Promoting contract and application versions between **testnet** and
-**production** is gated on a reviewed, machine-validated deployment manifest.
-A promotion must not proceed unless the manifest passes validation.
+- Add focused automated coverage for changed behavior, including failure and boundary cases.
+- Do not commit secrets, tokens, or credentials.
 
-### Manifest requirements
+## Verifier-backed conditional release policies
 
-Each promotion PR must include a deployment manifest that is validated for:
+Streams may make accrual or release conditional on a configured verifier result. When working on this capability, keep the following explicit in code, tests, and docs:
 
-- **Network** — the manifest's target network must match the environment being
-  promoted to (e.g. `testnet` → `production`). Mismatched networks are rejected.
-- **Contract ID** — the contract ID must match the deployed contract for the
-  source environment. Unknown or mismatched contract IDs are rejected.
-- **Artifact digest** — the artifact digest must match the built artifact being
-  promoted. A digest mismatch indicates the artifact changed after review and
-  is rejected.
-- **Schema compatibility** — the manifest schema version must be compatible with
-  the validator. Incompatible or unknown schema versions are rejected.
+- **Verifier identity**: record which verifier (address/identifier) is trusted for a stream. Only results from the configured verifier are honored; results from any other source must be rejected.
+- **Trust assumptions**: the protocol trusts the configured verifier to report results honestly and in a timely manner. It does not independently validate the underlying off-chain condition. Document this assumption wherever the policy is configured.
+- **Timeout**: define a bounded timeout for verifier responses. A result arriving after the timeout must not release funds.
+- **Failure mode**: define what happens when the verifier is unavailable, times out, or returns a malformed response. The default must be fail-closed — no release on an unverifiable result.
+- **Replay/nonce semantics**: results must be bound to a stream and a nonce (or equivalent) so a previously accepted result cannot be replayed to trigger additional release. Reject reused or out-of-order results.
 
-Any validation failure blocks promotion and surfaces a clear error identifying
-which field failed and why. Fix the manifest and re-request review rather than
-bypassing validation.
-
-### Approval responsibilities
-
-- **Author** — prepares the manifest, ensures it reflects the exact artifact
-  being promoted, and attaches validation output to the PR.
-- **Reviewer** — confirms the manifest matches the intended network, contract,
-  and artifact digest, and that schema compatibility passed. Reviewers are
-  accountable for approving the promotion.
-- **Release owner** — performs the promotion only after the manifest has been
-  reviewed and validated, and records the approval in the release notes.
-
-Promotions without a reviewed, validated manifest should be closed and returned
-to the author.
+When adding or changing this behavior, include tests for malformed verifier responses, an unavailable verifier, the timeout boundary, and replay attempts.

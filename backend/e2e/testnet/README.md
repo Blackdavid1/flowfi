@@ -49,46 +49,51 @@ tests are skipped when `DATABASE_URL` is unset.
 | `E2E_TX_TIMEOUT_MS` | `90000` |
 | `E2E_INDEXER_TIMEOUT_MS` | `120000` |
 
-## Network promotion & deployment manifest review
+## Supported compatibility matrix
 
-Promoting a contract or application version from **testnet** to **production**
-requires a reviewed, machine-validated deployment manifest. Promotion is
-**blocked** unless the manifest passes every check below.
+This matrix defines the tested boundaries for wallet and transaction
+workflows. Each entry is tied to concrete evidence so contributors can tell
+what is actually verified versus assumed. Anything not listed here is
+**unsupported** and must be treated as best-effort.
 
-### Manifest fields
+### Browsers
 
-| Field | Validated against |
-| --- | --- |
-| `network` | Target environment (`testnet` → `production`); must match the promotion target exactly |
-| `contractId` | The deployed contract ID for the source environment |
-| `artifactDigest` | SHA-256 digest of the built WASM/artifact being promoted |
-| `schemaVersion` | Schema compatibility with the target environment's expected version |
+| Browser | Minimum version | Evidence |
+| --- | --- | --- |
+| Chrome / Edge (Chromium) | last 2 stable majors | Manual: wallet connect + `create_stream`/`withdraw`/`cancel_stream` on Testnet per release checklist |
+| Firefox | last 2 stable majors | Manual: same release checklist |
+| Safari | last 2 stable majors | Manual: same release checklist |
+| Mobile browsers | _unsupported_ | — |
 
-### Validation rules
+Boundary rule: a browser one major below the minimum is **unsupported**; the
+release checklist must record the exact versions exercised so the matrix stays
+current.
 
-A promotion is rejected when any of the following hold:
+### Wallets
 
-- **Network mismatch** — `manifest.network` does not equal the promotion target
-  (e.g. promoting a `testnet` manifest into `production`).
-- **Contract ID mismatch** — `manifest.contractId` differs from the contract ID
-  recorded for the source environment.
-- **Artifact digest mismatch** — `manifest.artifactDigest` does not match the
-  digest of the artifact being promoted (tampered or stale build).
-- **Schema incompatibility** — `manifest.schemaVersion` is not compatible with
-  the target environment's expected schema version.
+| Wallet | Status | Evidence |
+| --- | --- | --- |
+| Freighter | Supported | Manual: connect + sign `create_stream`/`withdraw`/`cancel_stream` on Testnet |
+| WalletConnect-based wallets | Supported | Manual: connect + sign on Testnet |
+| Hardware wallets | _unsupported_ | — |
+| Custodial / exchange wallets | _unsupported_ | — |
 
-Each rejection surfaces a clear, actionable error naming the offending field so
-operators can correct the manifest before retrying.
+### Networks
 
-### Approval responsibilities
+| Network | Status | Evidence |
+| --- | --- | --- |
+| Stellar Testnet | Supported | Automated: `network-health.e2e.test.ts`, `stream-lifecycle.e2e.test.ts` (scheduled every 6h) |
+| Stellar Mainnet | Supported (manual sign-off) | Manual: release checklist transaction on Mainnet |
+| Futurenet / custom networks | _unsupported_ | — |
 
-- **Release author** — produces the manifest, ensures the artifact digest is
-  computed from the exact build being promoted, and opens the promotion PR.
-- **Reviewer (release owner)** — independently verifies the manifest fields
-  against the source environment and approves the promotion. A reviewer must
-  not approve their own manifest.
-- **On-call operator** — confirms the target environment is healthy and that
-  the schema version is compatible before the promotion is executed.
+### Communicating unsupported combinations
 
-Promotion must never bypass manifest validation, wallet authorization, or
-chain/network validation to force a release through.
+- **Users:** the app must surface an explicit, non-blocking message naming the
+  unsupported browser, wallet, or network and refuse to submit the transaction
+  rather than silently failing. Wallet authorization and chain/network
+  validation must never be bypassed to make an unsupported combination work.
+- **Contributors:** any change that widens or narrows this matrix must update
+  this table and its evidence in the same PR. A combination without an evidence
+  entry is unsupported by default.
+- **Failures:** a scheduled `testnet-e2e-failure` issue means the Testnet row
+  is no longer verified; treat Testnet as degraded until the run is green.
