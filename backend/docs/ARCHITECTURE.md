@@ -197,7 +197,30 @@ for the transaction.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
 
----
+### Cancellation
+
+A handoff can be cancelled by the user (wallet returns `status=cancelled`) or by
+the application (timeout / navigation away). Both paths resolve the pending
+promise with a `DeepLinkCancelledError` and never leave a dangling listener.
+
+### Return-Link Validation
+
+Return callbacks are untrusted input. The adapter rejects a callback when:
+
+- Required fields (`status`, `networkPassphrase`) are missing or malformed.
+- `status` is not one of `signed` / `cancelled` / `rejected`.
+- A `signed` response is missing a well-formed `signedXdr`.
+- The callback origin does not match the configured return origin.
+
+Malformed callbacks surface as `DeepLinkValidationError` and are never treated
+as a successful signature.
+
+### Network Matching
+
+The `networkPassphrase` in the return callback must equal the passphrase the
+request was built for. A mismatch (e.g. mainnet response for a testnet request)
+is rejected with `DeepLinkNetworkMismatchError` before the signed XDR is used.
+This preserves chain/network validation and prevents cross-network replay.
 
 ## Verifier-Backed Conditional Release Policies
 
