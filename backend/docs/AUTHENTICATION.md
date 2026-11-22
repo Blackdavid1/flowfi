@@ -252,6 +252,19 @@ Unexpected failures return a generic message with no stack trace or internal ide
 }
 ```
 
+### 503 Service Unavailable - Secret Unavailable
+
+Returned when a required secret could not be resolved (degraded startup or mid-run outage with no cached value). The message names the key path only, never the value.
+
+```json
+{
+  "error": "Service Unavailable",
+  "code": "SECRET_UNAVAILABLE",
+  "message": "Required secret is unavailable",
+  "requestId": "b1f2c3d4-..."
+}
+```
+
 ### Migration Notes (Errors)
 
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
