@@ -76,58 +76,48 @@ does not explicitly re-check `status`, so the invariant relies on the fact that
 `cancel_stream` sets `is_active = false` and `validate_stream_active` is called
 before `pause_stream`. See Testing #94 for test coverage of this invariant.
 
-## Scheduled Activation & Expiry
+## Stream Receipts (Non-Transferable Metadata)
 
-Streams may declare a future activation time and an optional expiry time so that
-accrual is bounded to a well-defined window. Both are expressed in **ledger
-timestamps** — Unix seconds (`u64`), the same unit returned by
-`env.ledger().timestamp()` and used by every other time field in the contract.
-They are **not** ledger sequence numbers.
+Every stream exposes a **read-only receipt** for wallets and indexers. A receipt is
+purely descriptive metadata: it is derived from the stream's stored state and is
+**not** a bearer instrument. Holding, displaying, or indexing a receipt grants **no**
+privileged action — all authorization still flows through the stream's `sender` /
+`recipient` checks in the contract entry points.
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `start_time` | `u64` | First ledger timestamp at which the stream accrues. `0` means "active immediately" (backwards compatible). |
-| `end_time` | `Option<u64>` | Optional last ledger timestamp at which the stream accrues. `None` means "no expiry" (backwards compatible). |
+### Receipt fields
 
-### Boundary Semantics
+| Field | Type | Description |
+|-------|------|-------------|
+| `stream_id` | `u64` | Identifier of the stream the receipt describes |
+| `sender` | `Address` | Stream funder (authorization subject for cancel/pause) |
+| `recipient` | `Address` | Stream beneficiary (authorization subject for withdraw) |
+| `token` | `Address` | Token contract being streamed |
+| `deposited` | `i128` | Total amount deposited into the stream |
+| `withdrawn` | `i128` | Total amount already withdrawn |
+| `status` | `StreamStatus` | Lifecycle status at read time |
+| `paused` | `bool` | Whether the stream is currently paused |
+| `is_active` | `bool` | Whether the stream is currently active |
 
-Accrual is computed over the half-open interval `[start_time, end_time)` clamped to
-`[start_time, now]`:
+### Lifecycle mapping
 
-- **Before start** (`now < start_time`): accrued amount is `0`. Claims succeed but
-  transfer nothing; `pause_stream` / `cancel_stream` remain allowed.
-- **Exact start** (`now == start_time`): accrual begins; accrued amount is `0` at
-  this instant and grows thereafter.
-- **Within window** (`start_time < now < end_time`): accrual is
-  `rate * (now - start_time - paused_duration)`.
-- **Exact end** (`now == end_time`): accrual stops at `end_time`; the full window
-  amount is claimable. No further accrual occurs after this instant.
-- **After end / late claim** (`now > end_time`): accrual is frozen at the window
-  total. Late claims are permitted and pay out the remaining vested balance; the
-  stream transitions to `Completed` once fully drained.
+The receipt's `status` / `paused` / `is_active` fields mirror the stream state machine
+above and are recomputed on every read, so the metadata stays stable and consistent
+through transitions:
 
-### Pause / Resume Interaction
+| Lifecycle | `status` | `paused` | `is_active` |
+|-----------|----------|----------|-------------|
+| Created / Active | `Active` | `false` | `true` |
+| Paused | `Paused` | `true` | `true` |
+| Resumed | `Active` | `false` | `true` |
+| Completed | `Completed` | `false` | `false` |
+| Cancelled | `Cancelled` | `false` | `false` |
 
-Pausing only suspends accrual while the stream is inside its active window. Time
-spent paused is excluded from the accrued total, so a stream paused before
-`start_time` accrues nothing until it is resumed and `now >= start_time`. Resuming
-a stream whose `end_time` has already passed does not restart accrual — the
-window total remains the ceiling.
+### Non-transferability & authorization
 
-### Cancellation Interaction
-
-`cancel_stream` refunds the sender the unvested portion of the funded amount,
-computed against the same `[start_time, end_time)` window. Cancelling before
-`start_time` refunds the full funded amount; cancelling after `end_time` refunds
-only what was never claimed. The permanent-cancellation invariant above still
-applies: a cancelled stream can never be resumed regardless of its window.
-
-### Validation
-
-`create_stream` rejects `end_time <= start_time` when `end_time` is `Some`, and
-rejects `start_time` values that are already in the past relative to the current
-ledger timestamp. Existing callers that omit the new fields keep the previous
-immediate-start, no-expiry behaviour.
+- Receipts are **not** transferable: there is no mint, transfer, or approval entry point.
+- Reading a receipt (`get_stream_receipt`) requires no authorization and confers none.
+- Privileged actions remain gated by the stream's `sender` / `recipient` checks; a
+  receipt holder who is neither cannot withdraw, pause, resume, or cancel.
 
 ## Building & Testing
 

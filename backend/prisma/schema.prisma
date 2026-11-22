@@ -8,7 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -49,12 +49,65 @@ model Stream {
   senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
   recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
   events            StreamEvent[]
+  releasePolicy     StreamReleasePolicy?
 
   @@index([sender])
   @@index([recipient])
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+}
+
+// StreamReleasePolicy model - verifier-backed conditional release policy (issue #214).
+//
+// A stream may be gated so that accrual/release only happens once a configured
+// verifier returns a positive result. Trust assumptions are explicit:
+//   * `verifierAddress` is the ONLY trusted identity. Results signed by any other
+//     key are rejected; the verifier is trusted to answer honestly for the
+//     `policyKey` it is asked about (it is NOT trusted to move funds).
+//   * `timeoutSeconds` bounds how long a pending verification may block release.
+//     On timeout the stream falls back to `onTimeout` (default: keep locked).
+//   * `onFailure` defines behavior when the verifier is unavailable or returns a
+//     malformed response (default: keep locked, never auto-release).
+//   * Replay protection: each verification result carries a unique `nonce`; the
+//     `(streamId, nonce)` pair is unique so a replayed result cannot release twice.
+model StreamReleasePolicy {
+  id              String   @id @default(uuid())
+  streamId        BigInt   @unique
+  verifierAddress String   // Trusted verifier Stellar public key (G...)
+  policyKey       String   // Opaque key the verifier answers about
+  timeoutSeconds  Int      @default(3600) // Max wait before onTimeout applies
+  onTimeout       String   @default("LOCK") // "LOCK" | "RELEASE"
+  onFailure       String   @default("LOCK") // "LOCK" | "RELEASE"
+  lastNonce       String?  // Highest accepted verifier nonce (replay guard)
+  isReleased      Boolean  @default(false)
+  releasedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  stream          Stream   @relation(fields: [streamId], references: [streamId], onDelete: Cascade)
+  results         VerifierResult[]
+
+  @@index([verifierAddress])
+  @@index([isReleased])
+}
+
+// VerifierResult model - records verifier responses for audit and replay defense.
+// `(policyId, nonce)` is unique so a replayed verifier result is rejected at the
+// storage layer, independent of application-level checks.
+model VerifierResult {
+  id          String   @id @default(uuid())
+  policyId    String
+  nonce       String   // Unique per verifier response; replay guard
+  approved    Boolean
+  rawResponse String?  // Original response payload for audit/debugging
+  receivedAt  DateTime @default(now())
+
+  policy      StreamReleasePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, nonce])
+  @@index([policyId])
+  @@index([receivedAt])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
@@ -79,6 +132,13 @@ model IndexerState {
 // signature, and event count the indexer ingested. Written on every ingestion
 // cycle so the worker can (a) prove the canonical chain still contains what it
 // indexed and (b) roll back deterministically when a fork replaces it.
+//
+// Snapshot contract (issue #228): the highest non-reverted ledgerSequence is the
+// single indexed checkpoint that ledger-consistent multi-resource snapshots are
+// pinned to. Stream, event, and balance reads for a snapshot MUST be filtered to
+// ledgerSequence <= that checkpoint so clients never combine data from different
+// ledgers. When the indexer lags behind the chain tip, the snapshot reports
+// staleness metadata and clients should retry rather than merge results.
 model LedgerCheckpoint {
   ledgerSequence Int      @id
   ledgerHash     String
@@ -89,6 +149,7 @@ model LedgerCheckpoint {
   isReverted     Boolean  @default(false)
 
   @@index([processedAt])
+  @@index([isReverted, ledgerSequence])
 }
 
 // StreamEvent model - indexer events for tracking all on-chain stream activities
@@ -118,6 +179,9 @@ model StreamEvent {
   // blockchain-ordered event listings. ledger_sequence is the total order on
   // Stellar — no two events in different ledgers share a sequence number.
   @@index([streamId, ledgerSequence])
+  // Snapshot index (issue #228): supports ledger-bounded event reads for a
+  // single checkpoint (ledgerSequence <= checkpoint) without a full scan.
+  @@index([ledgerSequence])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
@@ -193,31 +257,3 @@ model IndexerDeadLetterEvent {
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
-}
-
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
