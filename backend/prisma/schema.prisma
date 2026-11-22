@@ -48,6 +48,7 @@ model Stream {
   isPaused          Boolean   @default(false)
   pausedAt          BigInt?   // Unix timestamp when paused
   totalPausedDuration Int     @default(0) // Accumulated paused duration in seconds
+  version           Int       @default(0) // Optimistic-concurrency guard for stale stream mutations
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
