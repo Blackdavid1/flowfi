@@ -1,103 +1,78 @@
-export type ApiErrorCode =
-  | 'BAD_REQUEST'
-  | 'UNAUTHORIZED'
-  | 'FORBIDDEN'
-  | 'NOT_FOUND'
-  | 'CONFLICT'
-  | 'UNPROCESSABLE_ENTITY'
-  | 'RATE_LIMITED'
-  | 'COST_BUDGET_EXCEEDED'
-  | 'INTERNAL_ERROR'
-  | 'SERVICE_UNAVAILABLE';
+import type { Response } from 'express';
 
-export interface ApiErrorDetails {
+/**
+ * Standard API error envelope used across the backend.
+ *
+ * Existing error helpers rely on this shape, so it must remain stable.
+ */
+export interface ApiErrorBody {
+  error: {
+    code: string;
+    message: string;
+    details?: unknown;
+  };
+}
+
+/**
+ * Stable error code emitted when a client attempts to mutate a stream using a
+ * stale state version (i.e. the stream changed between review and execution).
+ */
+export const STREAM_VERSION_CONFLICT_CODE = 'STREAM_VERSION_CONFLICT' as const;
+
+export type StreamVersionConflictCode = typeof STREAM_VERSION_CONFLICT_CODE;
+
+/**
+ * Minimal, stable snapshot of the current stream state returned alongside a
+ * version conflict so clients can reconcile and retry.
+ */
+export interface StreamConflictState {
+  id: string;
+  version: number;
+  updatedAt: string;
+  status?: string;
   [key: string]: unknown;
 }
 
-export interface ApiErrorBody {
-  code: ApiErrorCode;
-  message: string;
-  requestId?: string;
-  version?: string;
-  details?: ApiErrorDetails;
-}
-
-export interface CostBudgetExceededDetails extends ApiErrorDetails {
-  cost: number;
-  limit: number;
-  windowMs: number;
-  retryAfter: number;
-}
-
-export interface CostBudgetExceededErrorBody extends ApiErrorBody {
-  code: 'COST_BUDGET_EXCEEDED';
-  details: CostBudgetExceededDetails;
-}
-
-export interface ApiErrorResponse {
-  error: ApiErrorBody;
-}
-
-export interface CostBudgetExceededErrorResponse {
-  error: CostBudgetExceededErrorBody;
-}
-
-export class ApiError extends Error {
-  public readonly code: ApiErrorCode;
-  public readonly status: number;
-  public readonly details?: ApiErrorDetails;
-
-  constructor(code: ApiErrorCode, message: string, status: number, details?: ApiErrorDetails) {
-    super(message);
-    this.name = 'ApiError';
-    this.code = code;
-    this.status = status;
-    this.details = details;
-  }
-
-  toBody(requestId?: string, version?: string): ApiErrorBody {
-    const body: ApiErrorBody = {
-      code: this.code,
-      message: this.message,
+/**
+ * Stable conflict error payload for stale stream mutations.
+ *
+ * Clients should treat `code === 'STREAM_VERSION_CONFLICT'` as a signal to
+ * refresh their view of the stream (using `currentVersion`/`updatedAt` and the
+ * embedded `stream` state) before retrying the mutation.
+ */
+export interface StreamConflictError extends ApiErrorBody {
+  error: {
+    code: StreamVersionConflictCode;
+    message: string;
+    details: {
+      currentVersion: number;
+      updatedAt: string;
+      stream: StreamConflictState;
     };
-    if (requestId !== undefined) {
-      body.requestId = requestId;
-    }
-    if (version !== undefined) {
-      body.version = version;
-    }
-    if (this.details !== undefined) {
-      body.details = this.details;
-    }
-    return body;
-  }
-
-  toResponse(requestId?: string, version?: string): ApiErrorResponse {
-    return { error: this.toBody(requestId, version) };
-  }
+  };
 }
 
-export class CostBudgetExceededError extends ApiError {
-  constructor(
-    message: string,
-    details: CostBudgetExceededDetails,
-    status = 429,
-  ) {
-    super('COST_BUDGET_EXCEEDED', message, status, details);
-    this.name = 'CostBudgetExceededError';
-  }
-
-  override toBody(requestId?: string, version?: string): CostBudgetExceededErrorBody {
-    return super.toBody(requestId, version) as CostBudgetExceededErrorBody;
-  }
-
-  override toResponse(requestId?: string, version?: string): CostBudgetExceededErrorResponse {
-    return { error: this.toBody(requestId, version) };
-  }
+/**
+ * Build the stable conflict error payload for a given stream.
+ */
+export function buildStreamConflictError(stream: StreamConflictState): StreamConflictError {
+  return {
+    error: {
+      code: STREAM_VERSION_CONFLICT_CODE,
+      message: 'Stream has been modified since the provided version; refresh and retry.',
+      details: {
+        currentVersion: stream.version,
+        updatedAt: stream.updatedAt,
+        stream,
+      },
+    },
+  };
 }
 
-export function isCostBudgetExceededErrorBody(
-  body: ApiErrorBody,
-): body is CostBudgetExceededErrorBody {
-  return body.code === 'COST_BUDGET_EXCEEDED';
+/**
+ * Emit a 409 Conflict with the standard error envelope for a stale stream
+ * mutation. Returns the response for convenience.
+ */
+export function sendStreamConflict(res: Response, stream: StreamConflictState): Response {
+  return res.status(409).json(buildStreamConflictError(stream));
 }

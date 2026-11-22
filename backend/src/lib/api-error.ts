@@ -1,12 +1,6 @@
-/**
- * API error helpers.
- *
- * Every helper returns a plain object that matches the shared API error
- * envelope so middleware and controllers can construct structured errors
- * without duplicating the envelope shape.
- */
+import type { Response } from 'express';
 
-export interface ApiErrorEnvelope {
+export interface ApiErrorBody {
   error: {
     code: string;
     message: string;
@@ -14,20 +8,23 @@ export interface ApiErrorEnvelope {
   };
 }
 
-export interface ApiErrorOptions {
+export interface SendApiErrorOptions {
+  status: number;
+  code: string;
+  message: string;
   details?: Record<string, unknown>;
-  message?: string;
 }
 
 /**
- * Generic structured API error.
+ * Sends a normalized API error response.
+ *
+ * All error responses share the same envelope so clients can rely on
+ * `error.code` for programmatic handling and `error.details` for context.
  */
-export function apiError(
-  code: string,
-  message: string,
-  details?: Record<string, unknown>,
-): ApiErrorEnvelope {
-  const envelope: ApiErrorEnvelope = {
+export function sendApiError(res: Response, options: SendApiErrorOptions): void {
+  const { status, code, message, details } = options;
+
+  const body: ApiErrorBody = {
     error: {
       code,
       message,
@@ -35,158 +32,55 @@ export function apiError(
   };
 
   if (details !== undefined) {
-    envelope.error.details = details;
+    body.error.details = details;
   }
 
-  return envelope;
+  res.status(status).json(body);
 }
 
 /**
- * 400 - malformed or invalid request payload.
+ * Stable error code returned when a mutation is rejected because the
+ * client's reviewed stream version no longer matches the current state.
  */
-export function badRequestError(
-  message = 'Bad request',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError('BAD_REQUEST', options.message ?? message, options.details);
+export const STREAM_VERSION_CONFLICT_CODE = 'STREAM_VERSION_CONFLICT';
+
+export interface StreamConflictMetadata {
+  streamId: string;
+  version: number;
+  updatedAt: string | Date;
+  isActive: boolean;
+  isPaused: boolean;
 }
 
 /**
- * 401 - missing or invalid authentication.
- */
-export function unauthorizedError(
-  message = 'Unauthorized',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError('UNAUTHORIZED', options.message ?? message, options.details);
-}
-
-/**
- * 403 - authenticated but not permitted.
- */
-export function forbiddenError(
-  message = 'Forbidden',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError('FORBIDDEN', options.message ?? message, options.details);
-}
-
-/**
- * 404 - resource not found.
- */
-export function notFoundError(
-  message = 'Not found',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError('NOT_FOUND', options.message ?? message, options.details);
-}
-
-/**
- * 409 - request conflicts with current resource state.
- */
-export function conflictError(
-  message = 'Conflict',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError('CONFLICT', options.message ?? message, options.details);
-}
-
-/**
- * 422 - request is well-formed but semantically invalid.
- */
-export function unprocessableEntityError(
-  message = 'Unprocessable entity',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError(
-    'UNPROCESSABLE_ENTITY',
-    options.message ?? message,
-    options.details,
-  );
-}
-
-/**
- * 429 - request count rate limit exceeded.
- */
-export function rateLimitExceededError(
-  retryAfterMs?: number,
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  const details: Record<string, unknown> = { ...(options.details ?? {}) };
-  if (retryAfterMs !== undefined) {
-    details.retryAfterMs = retryAfterMs;
-  }
-
-  return apiError(
-    'RATE_LIMIT_EXCEEDED',
-    options.message ?? 'Rate limit exceeded',
-    Object.keys(details).length > 0 ? details : undefined,
-  );
-}
-
-/**
- * 429 - request cost budget exceeded.
+ * Sends a 409 conflict response for stale stream mutations.
  *
- * Used by expensive read operations (analytics, exports, multi-resource
- * queries) that are governed by a complexity budget rather than a plain
- * request count. The envelope mirrors `rateLimitExceededError` but carries a
- * distinct `COST_BUDGET_EXCEEDED` code plus the cost accounting details so
- * clients can back off intelligently.
+ * This is the single source of truth for the `STREAM_VERSION_CONFLICT`
+ * contract. Clients should re-read the stream, review the current state,
+ * and resubmit with the returned `version` if the mutation is still desired.
  *
- * @param cost        Cost units consumed by the rejected request.
- * @param limit       Maximum cost units allowed in the window.
- * @param windowMs    Length of the budget window in milliseconds.
- * @param retryAfterMs Optional hint for when the client may retry.
+ * Wallet-signed transaction semantics are unchanged: the conflict is
+ * detected before any signed transaction is executed, so no on-chain
+ * side effects occur for a rejected request.
  */
-export function costBudgetExceededError(
-  cost: number,
-  limit: number,
-  windowMs: number,
-  retryAfterMs?: number,
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  const details: Record<string, unknown> = {
-    cost,
-    limit,
-    windowMs,
-    ...(options.details ?? {}),
-  };
+export function sendStreamConflict(
+  res: Response,
+  metadata: StreamConflictMetadata,
+): void {
+  const { streamId, version, updatedAt, isActive, isPaused } = metadata;
 
-  if (retryAfterMs !== undefined) {
-    details.retryAfterMs = retryAfterMs;
-  }
-
-  return apiError(
-    'COST_BUDGET_EXCEEDED',
-    options.message ?? 'Request cost budget exceeded',
-    details,
-  );
-}
-
-/**
- * 500 - unexpected server failure.
- */
-export function internalServerError(
-  message = 'Internal server error',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError(
-    'INTERNAL_SERVER_ERROR',
-    options.message ?? message,
-    options.details,
-  );
-}
-
-/**
- * 503 - upstream dependency unavailable.
- */
-export function serviceUnavailableError(
-  message = 'Service unavailable',
-  options: ApiErrorOptions = {},
-): ApiErrorEnvelope {
-  return apiError(
-    'SERVICE_UNAVAILABLE',
-    options.message ?? message,
-    options.details,
-  );
+  sendApiError(res, {
+    status: 409,
+    code: STREAM_VERSION_CONFLICT_CODE,
+    message:
+      'Stream has changed since the reviewed version. Re-read the stream and retry with the current version.',
+    details: {
+      streamId,
+      currentVersion: version,
+      updatedAt:
+        updatedAt instanceof Date ? updatedAt.toISOString() : updatedAt,
+      isActive,
+      isPaused,
+    },
+  });
 }

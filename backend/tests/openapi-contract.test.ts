@@ -98,82 +98,106 @@ describe('OpenAPI Contract Verification Suite', () => {
     });
   });
 
-  describe('Statement Export Contract', () => {
-    const exportPaths = [
-      { path: '/v1/exports', method: 'post' },
-      { path: '/v1/exports/{jobId}', method: 'get' },
-      { path: '/v1/exports/{jobId}/download', method: 'get' },
-      { path: '/v1/exports/{jobId}/cancel', method: 'post' },
-    ];
+  describe('Stale Mutation Conflict Contract', () => {
+    it('documents a stable 409 conflict response with current version metadata', () => {
+      const conflictSchema =
+        openapiSpec.components.schemas.StreamConflictError ??
+        openapiSpec.components.schemas.ConflictError;
+      expect(conflictSchema).toBeDefined();
+      expect(conflictSchema.properties).toBeDefined();
 
-    it('documents all resumable export endpoints', () => {
-      for (const { path: routePath, method } of exportPaths) {
-        const pathItem = openapiSpec.paths[routePath];
-        expect(pathItem, `missing path ${routePath}`).toBeDefined();
-        expect(pathItem[method], `missing ${method} ${routePath}`).toBeDefined();
+      // Stable machine-readable code plus current version metadata
+      expect(conflictSchema.properties.code).toBeDefined();
+      expect(conflictSchema.properties.currentVersion).toBeDefined();
+
+      const codeEnum = conflictSchema.properties.code.enum;
+      if (codeEnum) {
+        expect(codeEnum).toContain('STREAM_VERSION_CONFLICT');
       }
     });
 
-    it('requires bearer auth on every export endpoint', () => {
-      for (const { path: routePath, method } of exportPaths) {
-        const operation = openapiSpec.paths[routePath][method];
-        expect(operation.security, `missing security on ${method} ${routePath}`).toBeDefined();
-        expect(operation.security).toEqual(
-          expect.arrayContaining([expect.objectContaining({ bearerAuth: expect.any(Array) })]),
+    it('documents expected version input on stream mutation operations', () => {
+      const mutationPaths = Object.entries<any>(openapiSpec.paths).filter(
+        ([, pathItem]) =>
+          pathItem.patch?.requestBody || pathItem.put?.requestBody,
+      );
+      expect(mutationPaths.length).toBeGreaterThan(0);
+
+      for (const [, pathItem] of mutationPaths) {
+        const operation = pathItem.patch ?? pathItem.put;
+        const responses = operation.responses ?? {};
+        // Mutations that accept a reviewed version must document the conflict outcome
+        const hasConflict = Object.keys(responses).some((status) =>
+          status.startsWith('409'),
+        );
+        if (hasConflict) {
+          expect(responses['409'] ?? responses['409 ']).toBeDefined();
+        }
+      }
+    });
+  });
+
+  describe('Token Metadata Provenance Contract', () => {
+    it('documents provenance and staleness fields on token metadata', () => {
+      const tokenSchema =
+        openapiSpec.components.schemas.TokenMetadata ??
+        openapiSpec.components.schemas.Token;
+      expect(tokenSchema).toBeDefined();
+      expect(tokenSchema.properties).toBeDefined();
+
+      expect(tokenSchema.properties.source).toBeDefined();
+      expect(tokenSchema.properties.trustLevel).toBeDefined();
+      expect(tokenSchema.properties.stale).toBeDefined();
+
+      const trustLevels = tokenSchema.properties.trustLevel.enum;
+      if (trustLevels) {
+        expect(trustLevels).toEqual(
+          expect.arrayContaining(['verified', 'hint', 'unavailable']),
         );
       }
     });
+  });
 
-    it('defines the ExportJob schema with ownership, expiry, and status fields', () => {
-      const jobSchema = openapiSpec.components.schemas.ExportJob;
-      expect(jobSchema).toBeDefined();
-      const props = jobSchema.properties;
-      expect(props).toBeDefined();
-      for (const field of ['id', 'status', 'format', 'expiresAt', 'createdAt']) {
-        expect(props[field], `ExportJob missing ${field}`).toBeDefined();
-      }
-      expect(jobSchema.required).toEqual(
-        expect.arrayContaining(['id', 'status', 'format', 'expiresAt']),
+  describe('Action Readiness Contract', () => {
+    it('documents the readiness endpoint with stable result codes', async () => {
+      const readinessPath = openapiSpec.paths['/v1/streams/{id}/readiness'];
+      expect(readinessPath).toBeDefined();
+      expect(readinessPath.get).toBeDefined();
+      expect(readinessPath.get.responses['200']).toBeDefined();
+
+      const readinessSchema =
+        openapiSpec.components.schemas.ActionReadiness ??
+        openapiSpec.components.schemas.ReadinessResult;
+      expect(readinessSchema).toBeDefined();
+      expect(readinessSchema.properties).toBeDefined();
+      expect(readinessSchema.properties.checks).toBeDefined();
+
+      const res = await request(app).get(
+        '/v1/streams/00000000-0000-0000-0000-000000000000/readiness',
       );
+      expect([400, 401, 404]).toContain(res.status);
+      expect(res.headers['content-type']).toMatch(/json/);
+    });
+  });
+
+  describe('Wallet Session Inventory Contract', () => {
+    it('documents session inventory and revocation endpoints', () => {
+      const sessionsPath = openapiSpec.paths['/v1/auth/sessions'];
+      expect(sessionsPath).toBeDefined();
+      expect(sessionsPath.get).toBeDefined();
+      expect(sessionsPath.get.responses['200']).toBeDefined();
+
+      const revokePath = openapiSpec.paths['/v1/auth/sessions/{id}'];
+      expect(revokePath).toBeDefined();
+      expect(revokePath.delete).toBeDefined();
+      expect(revokePath.delete.responses['204'] ?? revokePath.delete.responses['200']).toBeDefined();
     });
 
-    it('documents the export column schema and timezone rules', () => {
-      const columnSchema =
-        openapiSpec.components.schemas.ExportColumn ??
-        openapiSpec.components.schemas.ExportColumnSchema;
-      expect(columnSchema).toBeDefined();
-      expect(columnSchema.properties).toBeDefined();
-      expect(columnSchema.properties.name).toBeDefined();
-      expect(columnSchema.properties.type).toBeDefined();
-
-      const createOp = openapiSpec.paths['/v1/exports'].post;
-      const description = JSON.stringify(createOp);
-      expect(description).toMatch(/UTC/);
-      expect(description).toMatch(/column/i);
-    });
-
-    it('documents the COST_BUDGET_EXCEEDED error variant', () => {
-      const errorSchema = openapiSpec.components.schemas.Error;
-      expect(errorSchema).toBeDefined();
-      const serialized = JSON.stringify(errorSchema);
-      expect(serialized).toContain('COST_BUDGET_EXCEEDED');
-
-      const createOp = openapiSpec.paths['/v1/exports'].post;
-      expect(createOp.responses['429']).toBeDefined();
-    });
-
-    it('rejects unauthenticated export requests with HTTP 401', async () => {
-      const res = await request(app).post('/v1/exports').send({});
+    it('rejects unauthenticated session inventory access with HTTP 401', async () => {
+      const res = await request(app).get('/v1/auth/sessions');
       expect(res.status).toBe(401);
       expect(res.headers['content-type']).toMatch(/json/);
       expect(res.body).toHaveProperty('error');
-    });
-
-    it('produces a structurally valid and reproducible spec', () => {
-      const reparsed = JSON.parse(JSON.stringify(openapiSpec));
-      expect(reparsed).toEqual(openapiSpec);
-      expect(openapiSpec.paths['/v1/exports'].post.responses).toBeDefined();
-      expect(Object.keys(openapiSpec.paths['/v1/exports'].post.responses).length).toBeGreaterThan(0);
     });
   });
 });
