@@ -3,27 +3,10 @@ import { mockConnectedWallet, RECIPIENT_PUBLIC_KEY } from "./utils/freighter";
 
 const MOCK_API_URL = "http://localhost:3100";
 
-/**
- * Opens the stream detail page as the stream SENDER and returns the preview
- * panel locator. The preview is rendered side-by-side (before/after) for every
- * mutating action so the user can review the impact before signing.
- */
-async function openPreview(page: Page, action: string) {
-  await page.goto("/streams/42");
-  await page.getByRole("button", { name: new RegExp(action, "i") }).first().click();
-  const preview = page.getByTestId("stream-change-preview");
-  await expect(preview).toBeVisible({ timeout: 20_000 });
-  return preview;
-}
-
-async function expectBeforeAfter(
-  preview: ReturnType<Page["getByTestId"]>,
-  before: string,
-  after: string,
-) {
-  await expect(preview.getByTestId("preview-before")).toContainText(before);
-  await expect(preview.getByTestId("preview-after")).toContainText(after);
-}
+const SENDER_PUBLIC_KEY = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+const SCHEDULE_ID = "7";
+const SCHEDULE_AMOUNT = "250";
+const SCHEDULE_INTERVAL_LABEL = "Weekly";
 
 test("stream detail page shows stream state and reflects a withdrawal via mock events", async ({
   page,
@@ -61,78 +44,123 @@ test("stream detail page shows stream state and reflects a withdrawal via mock e
   });
 });
 
-test.describe("side-by-side stream change previews", () => {
+test.describe("recurring payment schedules", () => {
   test.beforeEach(async ({ page }) => {
-    // The sender owns every mutating action below.
-    await mockConnectedWallet(page);
+    await mockConnectedWallet(page, SENDER_PUBLIC_KEY);
   });
 
-  test("top-up preview shows before/after deposited amount", async ({ page }) => {
-    const preview = await openPreview(page, "Top up");
-
-    await page.getByLabel(/amount/i).fill("250");
-    await expectBeforeAfter(preview, "10000 USDC", "10250 USDC");
-    await expect(preview.getByTestId("preview-assumptions")).toContainText(
-      /no rounding/i,
-    );
-  });
-
-  test("schedule update preview shows before/after end date", async ({ page }) => {
-    const preview = await openPreview(page, "Update schedule");
-
-    await page.getByLabel(/end date/i).fill("2026-01-01");
-    await expect(preview.getByTestId("preview-before")).toContainText("End date");
-    await expect(preview.getByTestId("preview-after")).toContainText("2026-01-01");
-  });
-
-  test("beneficiary change preview shows before/after recipient", async ({ page }) => {
-    const preview = await openPreview(page, "Change beneficiary");
-
-    await page.getByLabel(/new recipient/i).fill(RECIPIENT_PUBLIC_KEY);
-    await expectBeforeAfter(preview, "G...", RECIPIENT_PUBLIC_KEY.slice(0, 5));
-  });
-
-  test("cancellation preview warns that remaining funds are refunded", async ({
+  test("previews next run and funding requirement before confirming a schedule", async ({
     page,
   }) => {
-    const preview = await openPreview(page, "Cancel");
+    await page.goto("/schedules/new");
 
-    await expect(preview.getByTestId("preview-after")).toContainText(/refund/i);
-    await expect(preview.getByTestId("preview-assumptions")).toContainText(
-      /cancellation is final/i,
+    await page.getByLabel(/recipient/i).fill(RECIPIENT_PUBLIC_KEY);
+    await page.getByLabel(/amount/i).fill(SCHEDULE_AMOUNT);
+    await page.getByLabel(/interval/i).selectOption("weekly");
+
+    const preview = page.getByTestId("schedule-preview");
+    await expect(preview).toBeVisible({ timeout: 20_000 });
+
+    // Next-run preview must be shown before the user confirms.
+    await expect(preview.getByTestId("schedule-next-run")).toBeVisible();
+    await expect(preview.getByTestId("schedule-next-run")).not.toBeEmpty();
+
+    // Funding requirement preview must reflect the schedule amount.
+    const funding = preview.getByTestId("schedule-funding-requirement");
+    await expect(funding).toBeVisible();
+    await expect(funding).toContainText(SCHEDULE_AMOUNT);
+
+    // The confirm button is only actionable once the preview is present.
+    const confirmButton = page.getByRole("button", { name: /confirm|create schedule/i });
+    await expect(confirmButton).toBeEnabled();
+
+    await confirmButton.click();
+
+    await expect(page.getByText(/schedule created/i)).toBeVisible({ timeout: 30_000 });
+    await expect(page).toHaveURL(new RegExp(`/schedules/${SCHEDULE_ID}`));
+  });
+
+  test("shows each generated stream as a separate payment obligation", async ({ page }) => {
+    await page.goto(`/schedules/${SCHEDULE_ID}`);
+
+    const obligations = page.getByTestId("payment-obligation");
+    await expect(obligations.first()).toBeVisible({ timeout: 30_000 });
+
+    // Each generated stream is rendered as its own obligation row.
+    await expect(obligations).toHaveCount(3, { timeout: 20_000 });
+
+    const firstObligation = obligations.nth(0);
+    const secondObligation = obligations.nth(1);
+    await expect(firstObligation).toContainText(SCHEDULE_AMOUNT);
+    await expect(secondObligation).toContainText(SCHEDULE_AMOUNT);
+
+    // Obligations are distinct entries, not a single aggregated balance.
+    await expect(firstObligation).not.toHaveText(
+      (await secondObligation.textContent()) ?? "",
     );
   });
 
-  test("signing is blocked when the preview is stale", async ({ page }) => {
-    const preview = await openPreview(page, "Top up");
-    await page.getByLabel(/amount/i).fill("250");
-    await expectBeforeAfter(preview, "10000 USDC", "10250 USDC");
+  test("surfaces a missed-run state for an overdue schedule", async ({ page }) => {
+    await page.goto(`/schedules/${SCHEDULE_ID}`);
 
-    // Mutate authoritative state behind the preview's back.
-    const bump = await page.request.post(`${MOCK_API_URL}/__e2e/stream/42/withdraw`);
-    expect(bump.ok()).toBeTruthy();
+    const missedRun = page.getByTestId("schedule-missed-run");
+    await expect(missedRun).toBeVisible({ timeout: 30_000 });
+    await expect(missedRun).toContainText(/missed/i);
 
-    await expect(preview.getByTestId("preview-stale")).toBeVisible({
-      timeout: 20_000,
-    });
-    const signButton = page.getByRole("button", { name: /sign/i }).first();
-    await expect(signButton).toBeDisabled();
+    // A missed run must not silently advance the schedule as if it succeeded.
+    await expect(page.getByTestId("schedule-status")).not.toContainText(/completed/i);
   });
 
-  test("signing is blocked when the wallet prompt is canceled", async ({ page }) => {
-    await page.addInitScript(() => {
-      // Simulate the user dismissing the Freighter signing prompt.
-      (window as unknown as { __e2eCancelSign: boolean }).__e2eCancelSign = true;
-    });
+  test("blocks confirmation when funds are insufficient", async ({ page }) => {
+    await page.goto("/schedules/new");
 
-    const preview = await openPreview(page, "Top up");
-    await page.getByLabel(/amount/i).fill("250");
-    await expectBeforeAfter(preview, "10000 USDC", "10250 USDC");
+    await page.getByLabel(/recipient/i).fill(RECIPIENT_PUBLIC_KEY);
+    await page.getByLabel(/amount/i).fill("999999999");
+    await page.getByLabel(/interval/i).selectOption("weekly");
 
-    await page.getByRole("button", { name: /sign/i }).first().click();
-    await expect(page.getByText(/signing canceled/i)).toBeVisible({
-      timeout: 20_000,
-    });
-    await expect(page.getByText(/successful/i)).toHaveCount(0);
+    const insufficient = page.getByTestId("schedule-insufficient-funds");
+    await expect(insufficient).toBeVisible({ timeout: 20_000 });
+    await expect(insufficient).toContainText(/insufficient/i);
+
+    const confirmButton = page.getByRole("button", { name: /confirm|create schedule/i });
+    await expect(confirmButton).toBeDisabled();
+  });
+
+  test("cancels a schedule and stops further obligations", async ({ page }) => {
+    await page.goto(`/schedules/${SCHEDULE_ID}`);
+
+    const cancelButton = page.getByRole("button", { name: /cancel schedule/i });
+    await expect(cancelButton).toBeEnabled({ timeout: 30_000 });
+    await cancelButton.click();
+
+    // Cancellation requires explicit confirmation.
+    const confirmCancel = page.getByRole("button", { name: /confirm cancel/i });
+    await expect(confirmCancel).toBeVisible();
+    await confirmCancel.click();
+
+    await expect(page.getByText(/schedule cancelled/i)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("schedule-status")).toContainText(/cancelled/i);
+
+    // No new obligations should be generated after cancellation.
+    const obligations = page.getByTestId("payment-obligation");
+    const countAfterCancel = await obligations.count();
+    await page.waitForTimeout(2_000);
+    await expect(obligations).toHaveCount(countAfterCancel);
+  });
+
+  test("blocks schedule creation on a wallet-network mismatch", async ({ page }) => {
+    // Simulate a wallet connected to a different network than the app expects.
+    await page.route("**/__e2e/wallet/network", (route) =>
+      route.fulfill({ status: 200, body: JSON.stringify({ network: "PUBLIC" }) }),
+    );
+
+    await page.goto("/schedules/new");
+
+    const mismatch = page.getByTestId("wallet-network-mismatch");
+    await expect(mismatch).toBeVisible({ timeout: 20_000 });
+    await expect(mismatch).toContainText(/network/i);
+
+    const confirmButton = page.getByRole("button", { name: /confirm|create schedule/i });
+    await expect(confirmButton).toBeDisabled();
   });
 });

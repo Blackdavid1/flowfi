@@ -3,27 +3,30 @@
 import { useQuery } from "@tanstack/react-query";
 import { getApiBaseUrl } from "@/lib/api/_shared";
 
-export type AssetRiskStatus =
-  | "configured"
-  | "verified"
-  | "deprecated"
-  | "unverified"
-  | "blocked";
+/**
+ * Trust level describing how much confidence clients may place in a piece of
+ * token metadata.
+ *
+ * - `verified`: metadata confirmed against an authoritative source (e.g. the
+ *   token issuer or a curated registry). Safe to display as canonical.
+ * - `onchain`: metadata read directly from the token contract. Trustworthy
+ *   but not independently verified.
+ * - `hint`: best-effort / user-supplied metadata. Display only as a hint and
+ *   never use for accounting decisions.
+ * - `unknown`: no trustworthy source available; clients must fall back to
+ *   defaults (symbol = contract address, decimals = network default).
+ */
+export type TokenMetadataTrustLevel = "verified" | "onchain" | "hint" | "unknown";
 
-export interface TokenProvenance {
-  /** Where the metadata originated, e.g. "admin", "on-chain", "community". */
+export interface TokenMetadataProvenance {
+  /** Trust level of the metadata as reported by the API. */
+  trustLevel: TokenMetadataTrustLevel;
+  /** Human-readable source identifier (e.g. "registry", "contract", "user"). */
   source?: string;
-  /** Optional free-form reference (URL, registry id, tx hash, etc.). */
-  reference?: string | null;
-  /** ISO timestamp of when the metadata was last confirmed, if known. */
-  updatedAt?: string | null;
-}
-
-export interface TokenNetworkAddress {
-  /** Stellar network identifier, e.g. "mainnet", "testnet", "futurenet". */
-  network: string;
-  /** Contract address on that specific network. */
-  contractAddress: string;
+  /** ISO-8601 timestamp of when the metadata was last observed/updated. */
+  updatedAt?: string;
+  /** ISO-8601 timestamp after which the metadata should be considered stale. */
+  staleAt?: string;
 }
 
 export interface TokenMetadata {
@@ -32,123 +35,134 @@ export interface TokenMetadata {
   decimals: number;
   contractAddress: string;
   verified: boolean;
-  /** Optional risk/verification status supplied by the API. */
-  status?: AssetRiskStatus | string | null;
-  /** Optional flag indicating the asset has been deprecated. */
-  deprecated?: boolean | null;
-  /** Optional flag indicating the asset is blocked from use. */
-  blocked?: boolean | null;
-  /** Optional provenance information for the metadata. */
-  provenance?: TokenProvenance | null;
-  /** Optional per-network contract addresses. */
-  networkAddresses?: TokenNetworkAddress[] | null;
+  /** Provenance of the metadata. Optional for backwards compatibility. */
+  provenance?: TokenMetadataProvenance;
+  /** Whether the API flagged this entry as stale at response time. */
+  stale?: boolean;
 }
 
-export interface AssetRiskClassification {
-  status: AssetRiskStatus;
-  /** Raw identifiers preserved so callers can display them verbatim. */
-  symbol: string;
-  contractAddress: string;
-  network?: string;
-  /** Human-readable explanation of why the status was assigned. */
-  reason: string;
-}
+/** Default decimals used when no trustworthy metadata is available. */
+export const DEFAULT_TOKEN_DECIMALS = 7;
+
+/** Default staleness window applied when the API does not provide `staleAt`. */
+export const DEFAULT_TOKEN_METADATA_STALE_MS = 60 * 60 * 1000;
 
 const TOKEN_METADATA_QUERY_KEY = ["token-metadata"] as const;
 
-async function fetchTokenMetadata(network?: string): Promise<TokenMetadata[]> {
-  const base = `${getApiBaseUrl()}/v1/tokens`;
-  const url = network ? `${base}?network=${encodeURIComponent(network)}` : base;
-  const response = await fetch(url);
+const TRUST_LEVELS: readonly TokenMetadataTrustLevel[] = ["verified", "onchain", "hint", "unknown"];
+
+function normalizeTrustLevel(value: unknown, verified: boolean): TokenMetadataTrustLevel {
+  if (typeof value === "string" && (TRUST_LEVELS as readonly string[]).includes(value)) {
+    return value as TokenMetadataTrustLevel;
+  }
+  // Fallback: derive from the legacy `verified` flag.
+  return verified ? "verified" : "unknown";
+}
+
+function normalizeToken(raw: unknown): TokenMetadata | null {
+  if (!raw || typeof raw !== "object") return null;
+  const entry = raw as Record<string, unknown>;
+  const contractAddress = typeof entry.contractAddress === "string" ? entry.contractAddress : "";
+  if (!contractAddress) return null;
+
+  const verified = entry.verified === true;
+  const provenanceRaw =
+    entry.provenance && typeof entry.provenance === "object"
+      ? (entry.provenance as Record<string, unknown>)
+      : undefined;
+
+  const trustLevel = normalizeTrustLevel(provenanceRaw?.trustLevel, verified);
+  const decimals =
+    typeof entry.decimals === "number" && Number.isFinite(entry.decimals) && entry.decimals >= 0
+      ? Math.trunc(entry.decimals)
+      : DEFAULT_TOKEN_DECIMALS;
+
+  const provenance: TokenMetadataProvenance = {
+    trustLevel,
+    source: typeof provenanceRaw?.source === "string" ? provenanceRaw.source : undefined,
+    updatedAt: typeof provenanceRaw?.updatedAt === "string" ? provenanceRaw.updatedAt : undefined,
+    staleAt: typeof provenanceRaw?.staleAt === "string" ? provenanceRaw.staleAt : undefined,
+  };
+
+  return {
+    symbol: typeof entry.symbol === "string" && entry.symbol ? entry.symbol : contractAddress,
+    name: typeof entry.name === "string" && entry.name ? entry.name : contractAddress,
+    decimals,
+    contractAddress,
+    verified,
+    provenance,
+    stale: entry.stale === true,
+  };
+}
+
+async function fetchTokenMetadata(): Promise<TokenMetadata[]> {
+  const response = await fetch(`${getApiBaseUrl()}/v1/tokens`);
   if (!response.ok) throw new Error(`Failed to fetch token metadata (${response.status})`);
-  const payload = (await response.json()) as { tokens?: TokenMetadata[] };
-  return Array.isArray(payload.tokens) ? payload.tokens : [];
+  const payload = (await response.json()) as { tokens?: unknown };
+  if (!Array.isArray(payload.tokens)) return [];
+  return payload.tokens
+    .map(normalizeToken)
+    .filter((entry): entry is TokenMetadata => entry !== null);
+}
+
+/**
+ * Returns true when the metadata entry should be treated as stale, either
+ * because the API flagged it or because its `staleAt` timestamp has passed.
+ */
+export function isTokenMetadataStale(
+  token: TokenMetadata,
+  now: number = Date.now(),
+): boolean {
+  if (token.stale === true) return true;
+  const staleAt = token.provenance?.staleAt;
+  if (!staleAt) return false;
+  const parsed = Date.parse(staleAt);
+  if (Number.isNaN(parsed)) return true; // malformed timestamp -> treat as stale
+  return parsed <= now;
+}
+
+/**
+ * Returns true when the metadata may be used for display as canonical data.
+ * Stale or untrusted entries are treated as hints only.
+ */
+export function isTokenMetadataTrusted(
+  token: TokenMetadata,
+  now: number = Date.now(),
+): boolean {
+  const trustLevel = token.provenance?.trustLevel ?? (token.verified ? "verified" : "unknown");
+  if (trustLevel !== "verified" && trustLevel !== "onchain") return false;
+  return !isTokenMetadataStale(token, now);
 }
 
 export function useTokenMetadata(network?: string) {
   return useQuery({
-    queryKey: [...TOKEN_METADATA_QUERY_KEY, network ?? "default"],
-    queryFn: () => fetchTokenMetadata(network),
-    staleTime: 60 * 60 * 1000,
+    queryKey: TOKEN_METADATA_QUERY_KEY,
+    queryFn: fetchTokenMetadata,
+    staleTime: DEFAULT_TOKEN_METADATA_STALE_MS,
     gcTime: 24 * 60 * 60 * 1000,
     retry: 1,
   });
 }
 
+/**
+ * Resolves the decimals for a symbol. Falls back to the network default when
+ * the token is unknown, metadata is unavailable, or the entry is untrusted.
+ * Raw on-chain amounts are never altered by this helper.
+ */
 export function getTokenDecimals(symbol: string, tokens: TokenMetadata[] = []): number {
-  return tokens.find((entry) => entry.symbol.toUpperCase() === symbol.toUpperCase())?.decimals ?? 7;
+  const match = tokens.find((entry) => entry.symbol.toUpperCase() === symbol.toUpperCase());
+  if (!match) return DEFAULT_TOKEN_DECIMALS;
+  if (!isTokenMetadataTrusted(match)) return DEFAULT_TOKEN_DECIMALS;
+  return match.decimals;
 }
 
 /**
- * Resolve the contract address for a token on a specific network, falling back
- * to the top-level contract address when no network-specific entry exists.
+ * Resolves the display metadata for a symbol, including provenance and
+ * staleness so the UI can distinguish verified data from hints.
  */
-export function getTokenContractAddress(
-  token: TokenMetadata,
-  network?: string,
-): string {
-  if (network && Array.isArray(token.networkAddresses)) {
-    const match = token.networkAddresses.find(
-      (entry) => entry.network.toLowerCase() === network.toLowerCase(),
-    );
-    if (match) return match.contractAddress;
-  }
-  return token.contractAddress;
-}
-
-/**
- * Classify an asset's risk status. Precedence: blocked > deprecated > verified >
- * configured > unverified. Raw identifiers are always preserved in the result so
- * callers can display them even when metadata is unknown or the asset is blocked.
- */
-export function classifyAssetRisk(
-  token: TokenMetadata,
-  network?: string,
-): AssetRiskClassification {
-  const contractAddress = getTokenContractAddress(token, network);
-  const base = {
-    symbol: token.symbol,
-    contractAddress,
-    network,
-  };
-
-  const rawStatus = typeof token.status === "string" ? token.status.toLowerCase() : null;
-
-  if (token.blocked === true || rawStatus === "blocked") {
-    return {
-      ...base,
-      status: "blocked",
-      reason: "Asset is blocked and cannot be used to create or fund streams.",
-    };
-  }
-
-  if (token.deprecated === true || rawStatus === "deprecated") {
-    return {
-      ...base,
-      status: "deprecated",
-      reason: "Asset is deprecated; prefer a supported replacement.",
-    };
-  }
-
-  if (token.verified === true || rawStatus === "verified") {
-    return {
-      ...base,
-      status: "verified",
-      reason: "Asset metadata has been verified.",
-    };
-  }
-
-  if (rawStatus === "configured") {
-    return {
-      ...base,
-      status: "configured",
-      reason: "Asset is configured by the operator but not independently verified.",
-    };
-  }
-
-  return {
-    ...base,
-    status: "unverified",
-    reason: "Asset metadata is unknown or unverified; confirm the contract address before use.",
-  };
+export function getTokenMetadata(
+  symbol: string,
+  tokens: TokenMetadata[] = [],
+): TokenMetadata | undefined {
+  return tokens.find((entry) => entry.symbol.toUpperCase() === symbol.toUpperCase());
 }
