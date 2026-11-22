@@ -466,5 +466,5 @@ MIT.
 
 ## Handsoff notes
 
-<!-- handsoff-issue-225 -->
-- #225: feat(contracts): add per-asset emergency quarantine controls
+<!-- handsoff-issue-213 -->
+- #213: feat(contracts): allow third-party contributions to funded streams
