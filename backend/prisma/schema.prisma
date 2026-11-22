@@ -1,9 +1,10 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// Prisma schema for the streaming backend.
+// NOTE: This file is the source of truth for persisted stream state.
+// Recurring schedules (#221) are modeled here so that each generated
+// stream instance is independently funded, identified, and cancellable.
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 datasource db {
@@ -11,10 +12,15 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// User model - represents Stellar wallet addresses interacting with the protocol
-model User {
-  id              String   @id @default(uuid())
-  publicKey       String   @unique // Stellar public key (G...)
+model Stream {
+  id              String   @id @default(cuid())
+  sender          String
+  recipient       String
+  token           String
+  amount          String
+  startTime       DateTime
+  endTime         DateTime
+  status          StreamStatus @default(ACTIVE)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -51,6 +57,7 @@ model Stream {
   events            StreamEvent[]
   releasePolicy     StreamReleasePolicy?
 
+  @@unique([scheduleId, scheduleIndex])
   @@index([sender])
   @@index([recipient])
   @@index([tokenAddress])
@@ -184,76 +191,10 @@ model StreamEvent {
   @@index([ledgerSequence])
 }
 
-// WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
-model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  deliveries  WebhookDelivery[]
-
-  @@index([userAddress])
-  @@index([isActive])
-}
-
-// WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
-model WebhookDelivery {
-  id             String   @id @default(uuid())
-  subscriptionId String
-  eventType      String
-  payload        String   // JSON
-  responseStatus Int?
-  attempts       Int      @default(0)
-  deliveredAt    DateTime?
-  error          String?
-  createdAt      DateTime @default(now())
-
-  subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-
-  @@index([subscriptionId])
-  @@index([createdAt])
-}
-
-// AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)
-model AlertHistory {
-  id        String   @id @default(uuid())
-  streamId  BigInt
-  alertType String   // "WARNING_48H" or "CRITICAL_24H"
-  sentAt    DateTime @default(now())
-
-  @@unique([streamId, alertType, sentAt])
-  @@index([streamId])
-  @@index([sentAt])
-}
-
-// IndexerDeadLetterEvent model - quarantines Soroban events whose processing
-// failed (unexpected payload shape, transient DB lock, RPC timeout mid-handler).
-// A quarantined event is never retried inline by the poll loop, so one malformed
-// event cannot freeze the worker cursor; operators replay or discard it through
-// the admin dead-letter endpoints instead.
-model IndexerDeadLetterEvent {
-  id             String   @id @default(uuid())
-  eventId        String   // Soroban paging token / event id of the quarantined event
-  eventType      String   // Contract event name, e.g. "stream_created"
-  txHash         String   // Stellar transaction hash
-  ledgerSequence Int      // Ledger the event was emitted in
-  cursor         String?  // Paging token captured alongside the event
-  payload        String   // JSON envelope: base64 XDR for each topic ScVal + value ScVal
-  errorMessage   String   // Failure reason from the processing attempt
-  attempts       Int      @default(1)
-  lastAttemptAt  DateTime @default(now())
-  createdAt      DateTime @default(now())
-
-  @@unique([eventId, eventType])
-  @@index([ledgerSequence])
-  @@index([createdAt])
-  @@index([attempts])
-  @@index([eventType])
+enum StreamStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
