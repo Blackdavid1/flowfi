@@ -201,11 +201,11 @@ export default function TransactionTracker({
 
     case "pending":
       return (
-        <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+        <div className="financial-view rounded-xl border border-white/10 bg-white/5 p-4">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-accent" />
             <div>
-              <p className="font-medium">Transaction Pending</p>
+              <p role="status" className="font-medium">Transaction Pending</p>
               <p className="text-sm text-slate-400">Preparing {ACTION_LABELS[action].present.toLowerCase()}...</p>
             </div>
           </div>
@@ -214,11 +214,11 @@ export default function TransactionTracker({
 
     case "simulating":
       return (
-        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+        <div className="financial-view rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-blue-400" />
             <div>
-              <p className="font-medium text-blue-400">Simulating Transaction</p>
+              <p role="status" className="font-medium text-blue-400">Simulating Transaction</p>
               <p className="text-sm text-blue-400/70">Checking the contract call...</p>
             </div>
           </div>
@@ -228,14 +228,14 @@ export default function TransactionTracker({
     case "awaiting_approval":
     case "signing":
       return (
-        <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+        <div className="financial-view rounded-xl border border-white/10 bg-white/5 p-4">
           <div className="flex items-center gap-3">
             <div className="relative">
               <Loader2 className="h-5 w-5 animate-spin text-accent" />
               <div className="absolute inset-0 h-5 w-5 animate-ping rounded-full bg-accent/20" />
             </div>
             <div>
-              <p className="font-medium">Sign in Wallet</p>
+              <p role="status" className="font-medium">Sign in Wallet</p>
               <p className="text-sm text-slate-400">
                 {ACTION_LABELS[action].present} - confirm in your wallet
               </p>
@@ -254,11 +254,11 @@ export default function TransactionTracker({
 
     case "submitted":
       return (
-        <div className="rounded-xl border border-yellow-500/20 bg-yellow-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-yellow-500/20 bg-yellow-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-yellow-400" />
             <div>
-              <p className="font-medium text-yellow-400">Transaction Submitted</p>
+              <p role="status" className="font-medium text-yellow-400">Transaction Submitted</p>
               <p className="text-sm text-yellow-400/70">
                 Waiting for ledger inclusion...
               </p>
@@ -282,14 +282,14 @@ export default function TransactionTracker({
 
     case "confirming":
       return (
-        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-blue-500/20 bg-blue-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <div className="relative">
               <Clock className="h-5 w-5 text-blue-400" />
               <Loader2 className="h-5 w-5 animate-spin absolute inset-0 text-blue-400" />
             </div>
             <div className="flex-1">
-              <p className="font-medium text-blue-400">Confirming on Indexer</p>
+              <p role="status" className="font-medium text-blue-400">Confirming on Indexer</p>
               <p className="text-sm text-blue-400/70">
                 Polling every 3s... (attempt {pollCount}/{MAX_POLL_ATTEMPTS})
               </p>
@@ -320,11 +320,11 @@ export default function TransactionTracker({
 
     case "confirmed":
       return (
-        <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-green-500/20 bg-green-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <CheckCircle className="h-5 w-5 text-green-400" />
             <div>
-              <p className="font-medium text-green-400">
+              <p role="status" className="font-medium text-green-400">
                 {ACTION_LABELS[action].past} Successfully
               </p>
               <p className="text-sm text-green-400/70">
@@ -359,11 +359,11 @@ export default function TransactionTracker({
 
     case "timeout":
       return (
-        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <Clock className="h-5 w-5 text-amber-400" />
             <div>
-              <p className="font-medium text-amber-400">Confirmation Timed Out</p>
+              <p role="status" className="font-medium text-amber-400">Confirmation Timed Out</p>
               <p className="text-sm text-amber-400/70">The transaction may still be indexing. Check its status before retrying.</p>
             </div>
           </div>
@@ -377,11 +377,11 @@ export default function TransactionTracker({
 
     case "failed":
       return (
-        <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-red-500/20 bg-red-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <XCircle className="h-5 w-5 text-red-400" />
             <div>
-              <p className="font-medium text-red-400">Transaction Failed</p>
+              <p role="status" className="font-medium text-red-400">Transaction Failed</p>
               <p className="text-sm text-red-400/70">
                 {ACTION_LABELS[action].present} failed
               </p>
@@ -420,11 +420,11 @@ export default function TransactionTracker({
 
     case "cancelled":
       return (
-        <div className="rounded-xl border border-slate-500/20 bg-slate-500/10 p-4">
+        <div className="financial-view rounded-xl border border-slate-500/20 bg-slate-500/10 p-4">
           <div className="flex items-center gap-3">
             <Ban className="h-5 w-5 text-slate-400" />
             <div>
-              <p className="font-medium text-slate-400">Action Cancelled</p>
+              <p role="status" className="font-medium text-slate-400">Action Cancelled</p>
               <p className="text-sm text-slate-400/70">
                 {ACTION_LABELS[action].present} was cancelled
               </p>

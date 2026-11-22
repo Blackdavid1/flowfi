@@ -1,4 +1,10 @@
-import type { BackendStream } from "@/lib/api-types";
+import type {
+  BackendStream,
+  RecurringSchedule,
+  RecurringScheduleCreateRequest,
+  ScheduleFundingPreview,
+  ScheduleRun,
+} from "@/lib/api-types";
 import { TOKEN_ADDRESSES } from "@/lib/soroban";
 import { shortenPublicKey } from "@/lib/wallet";
 import {
@@ -9,145 +15,54 @@ import {
 } from "@/lib/api/_shared";
 
 /**
- * Non-secret recovery metadata returned when a stream creation is submitted.
- *
- * This is intentionally limited to public identifiers and amounts so it can be
- * persisted by the transaction center and used to resume/inspect a submission
- * after a reload. It must never contain private keys, signed XDR, or auth tokens.
+ * Stable error code returned by the backend when a mutation is rejected
+ * because the stream changed after the client reviewed it.
  */
-export interface StreamCreationRecoveryMetadata {
-  /** Client-generated idempotency key used to dedupe submissions. */
-  idempotencyKey: string;
-  /** On-chain transaction hash, when the backend has already broadcast it. */
-  transactionHash: string | null;
-  /** Backend stream id, when the stream record has been created. */
-  streamId: string | null;
-  /** Recipient public key (public, non-secret). */
-  recipient: string;
-  /** Token contract address (public, non-secret). */
-  tokenAddress: string;
-  /** Total deposited amount as a decimal string. */
-  depositedAmount: string;
-  /** Ledger timestamp at which the submission was accepted. */
-  submittedAt: number;
-}
+export const STREAM_VERSION_CONFLICT_CODE = "STREAM_VERSION_CONFLICT" as const;
 
-export interface SubmitStreamCreationParams {
-  recipient: string;
-  tokenAddress: string;
-  depositedAmount: string;
-  /** Optional client-generated idempotency key. Generated when omitted. */
-  idempotencyKey?: string;
-  authToken?: string | null;
-  timeoutMs?: number;
-}
-
-export interface SubmitStreamCreationResult {
-  transactionHash: string | null;
-  streamId: string | null;
-  recovery: StreamCreationRecoveryMetadata;
+/**
+ * Payload returned alongside a 409 response for stale stream mutations.
+ * `currentVersion` is the version the client must re-read before retrying.
+ */
+export interface StreamVersionConflict {
+  code: typeof STREAM_VERSION_CONFLICT_CODE;
+  message: string;
+  streamId: number;
+  expectedVersion: number;
+  currentVersion: number;
+  currentLastUpdateTime?: number;
 }
 
 /**
- * In-flight idempotency keys. Prevents duplicate submissions from firing a
- * second network request while the first is still pending.
+ * Thrown by mutation helpers when the backend reports a version conflict.
+ * Callers can catch this to refresh the stream and re-prompt the user.
  */
-const inFlightIdempotencyKeys = new Set<string>();
+export class StreamVersionConflictError extends Error {
+  readonly conflict: StreamVersionConflict;
 
-export class DuplicateSubmissionError extends Error {
-  constructor(public readonly idempotencyKey: string) {
-    super(`Duplicate stream submission for idempotency key: ${idempotencyKey}`);
-    this.name = "DuplicateSubmissionError";
+  constructor(conflict: StreamVersionConflict) {
+    super(conflict.message);
+    this.name = "StreamVersionConflictError";
+    this.conflict = conflict;
   }
 }
 
-function generateIdempotencyKey(): string {
-  const cryptoObj = globalThis.crypto;
-  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
-    return cryptoObj.randomUUID();
-  }
-  // Fallback for environments without crypto.randomUUID.
-  return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+export type ReadinessSeverity = "blocker" | "warning";
+
+export interface ReadinessCheck {
+  code: string;
+  severity: ReadinessSeverity;
+  message: string;
 }
 
-function resolveStreamsBaseEndpoint(): string {
-  const [endpoint] = getStreamsEndpointCandidates();
-  if (!endpoint) {
-    throw new Error("No streams endpoint configured.");
-  }
-  return endpoint;
-}
-
-/**
- * Submits a stream creation request to the backend.
- *
- * Duplicate submissions sharing the same idempotency key are rejected
- * client-side (before any network call) with a {@link DuplicateSubmissionError}.
- * The returned recovery metadata contains only non-secret fields.
- */
-export async function submitStreamCreation(
-  params: SubmitStreamCreationParams,
-): Promise<SubmitStreamCreationResult> {
-  const idempotencyKey = params.idempotencyKey ?? generateIdempotencyKey();
-
-  if (inFlightIdempotencyKeys.has(idempotencyKey)) {
-    throw new DuplicateSubmissionError(idempotencyKey);
-  }
-
-  inFlightIdempotencyKeys.add(idempotencyKey);
-
-  try {
-    const endpoint = resolveStreamsBaseEndpoint();
-    const response = await fetchWithTimeout(
-      endpoint,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": idempotencyKey,
-          ...(params.authToken
-            ? { Authorization: `Bearer ${params.authToken}` }
-            : {}),
-        },
-        body: JSON.stringify({
-          recipient: params.recipient,
-          tokenAddress: params.tokenAddress,
-          depositedAmount: params.depositedAmount,
-        }),
-      },
-      params.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to submit stream creation (${response.status}) from ${endpoint}`,
-      );
-    }
-
-    const payload = (await response.json()) as {
-      transactionHash?: string | null;
-      streamId?: string | null;
-    };
-
-    const transactionHash = payload.transactionHash ?? null;
-    const streamId = payload.streamId ?? null;
-
-    return {
-      transactionHash,
-      streamId,
-      recovery: {
-        idempotencyKey,
-        transactionHash,
-        streamId,
-        recipient: params.recipient,
-        tokenAddress: params.tokenAddress,
-        depositedAmount: params.depositedAmount,
-        submittedAt: Date.now(),
-      },
-    };
-  } finally {
-    inFlightIdempotencyKeys.delete(idempotencyKey);
-  }
+export interface StreamReadiness {
+  streamId: number;
+  action: string;
+  ready: boolean;
+  version: number;
+  checkedAt: number;
+  blockers: ReadinessCheck[];
+  warnings: ReadinessCheck[];
 }
 
 export type IncomingStreamStatus = "Active" | "Paused" | "Completed";
@@ -210,6 +125,141 @@ function mapBackendStream(stream: BackendStream): IncomingStreamRecord {
   };
 }
 
+function isVersionConflictPayload(value: unknown): value is StreamVersionConflict {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<StreamVersionConflict>;
+  return (
+    candidate.code === STREAM_VERSION_CONFLICT_CODE &&
+    typeof candidate.streamId === "number" &&
+    typeof candidate.expectedVersion === "number" &&
+    typeof candidate.currentVersion === "number"
+  );
+}
+
+async function parseVersionConflict(
+  response: Response,
+  fallback: { streamId: number; expectedVersion: number },
+): Promise<StreamVersionConflictError> {
+  let payload: unknown = null;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  const conflict: StreamVersionConflict = isVersionConflictPayload(payload)
+    ? payload
+    : {
+        code: STREAM_VERSION_CONFLICT_CODE,
+        message: "Stream changed since it was reviewed. Refresh and retry.",
+        streamId: fallback.streamId,
+        expectedVersion: fallback.expectedVersion,
+        currentVersion: -1,
+      };
+
+  return new StreamVersionConflictError(conflict);
+}
+
+export interface StreamMutationOptions {
+  /** Version the client reviewed; sent as `expectedVersion` for optimistic concurrency. */
+  expectedVersion: number;
+  authToken?: string | null;
+  timeoutMs?: number;
+}
+
+/**
+ * Submit a stream mutation with optimistic concurrency control.
+ *
+ * The wallet-signed transaction is still required and validated server-side;
+ * `expectedVersion` only guards against acting on stale state. A 409 response
+ * is surfaced as a {@link StreamVersionConflictError} carrying the current
+ * version metadata so callers can refresh and retry.
+ */
+export async function submitStreamMutation(
+  streamId: number,
+  action: string,
+  signedTransactionXdr: string,
+  options: StreamMutationOptions,
+): Promise<unknown> {
+  const endpoints = getStreamsEndpointCandidates();
+  const endpoint = endpoints[0];
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+
+  const response = await fetchWithTimeout(
+    `${endpoint}/${streamId}/${action}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options.authToken
+          ? { Authorization: `Bearer ${options.authToken}` }
+          : {}),
+      },
+      body: JSON.stringify({
+        signedTransactionXdr,
+        expectedVersion: options.expectedVersion,
+      }),
+    },
+    timeoutMs,
+  );
+
+  if (response.status === 409) {
+    throw await parseVersionConflict(response, {
+      streamId,
+      expectedVersion: options.expectedVersion,
+    });
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Stream mutation failed (${response.status}) for ${action} on ${streamId}`,
+    );
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch machine-readable preflight readiness for a stream action.
+ *
+ * Results are advisory only: `ready === true` does not guarantee the
+ * transaction will succeed, since state can change between the check and the
+ * signed submission. Blockers must be resolved; warnings are informational.
+ */
+export async function fetchStreamReadiness(
+  streamId: number,
+  action: string,
+  options: { authToken?: string | null; timeoutMs?: number } = {},
+): Promise<StreamReadiness> {
+  const endpoints = getStreamsEndpointCandidates();
+  const endpoint = endpoints[0];
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const params = new URLSearchParams({ action });
+
+  const response = await fetchWithTimeout(
+    `${endpoint}/${streamId}/readiness?${params.toString()}`,
+    { headers: options.authToken ? { Authorization: `Bearer ${options.authToken}` } : {} },
+    timeoutMs,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch readiness (${response.status}) for ${action} on ${streamId}`,
+    );
+  }
+
+  const payload = (await response.json()) as Partial<StreamReadiness>;
+  return {
+    streamId: payload.streamId ?? streamId,
+    action: payload.action ?? action,
+    ready: payload.ready ?? false,
+    version: payload.version ?? -1,
+    checkedAt: payload.checkedAt ?? Date.now(),
+    blockers: payload.blockers ?? [],
+    warnings: payload.warnings ?? [],
+  };
+}
+
 export async function fetchIncomingStreams(
   recipientPublicKey: string,
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
@@ -248,4 +298,210 @@ export async function fetchIncomingStreams(
   }
 
   throw lastError ?? new Error("Failed to fetch incoming streams from backend.");
+}
+
+// ---------------------------------------------------------------------------
+// Recurring payment schedules
+// ---------------------------------------------------------------------------
+
+export interface RecurringScheduleRecord {
+  id: string;
+  scheduleId: number;
+  sender: string;
+  senderDisplay: string;
+  recipient: string;
+  recipientDisplay: string;
+  token: string;
+  tokenAddress: string;
+  amountPerRun: number;
+  intervalSeconds: number;
+  nextRunAt: number;
+  remainingRuns: number;
+  status: RecurringSchedule["status"];
+  /** Each generated stream is tracked as its own payment obligation. */
+  runs: ScheduleRun[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ScheduleFundingPreviewRecord {
+  scheduleId: number;
+  token: string;
+  tokenAddress: string;
+  requiredAmount: number;
+  availableBalance: number;
+  shortfall: number;
+  sufficient: boolean;
+  nextRunAt: number;
+  checkedAt: number;
+}
+
+interface ScheduleListResponse {
+  data?: RecurringSchedule[];
+}
+
+interface ScheduleFundingPreviewResponse {
+  data?: ScheduleFundingPreview;
+}
+
+function resolveScheduleEndpointCandidates(): string[] {
+  return getStreamsEndpointCandidates().map((endpoint) =>
+    endpoint.replace(/\/streams\/?$/, "/schedules"),
+  );
+}
+
+function mapScheduleRun(run: ScheduleRun): ScheduleRun {
+  return {
+    ...run,
+    amount: toTokenAmount(run.amount),
+  };
+}
+
+function mapRecurringSchedule(schedule: RecurringSchedule): RecurringScheduleRecord {
+  return {
+    id: schedule.id,
+    scheduleId: schedule.scheduleId,
+    sender: schedule.sender,
+    senderDisplay: shortenPublicKey(schedule.sender),
+    recipient: schedule.recipient,
+    recipientDisplay: shortenPublicKey(schedule.recipient),
+    token: resolveTokenLabel(schedule.tokenAddress),
+    tokenAddress: schedule.tokenAddress,
+    amountPerRun: toTokenAmount(schedule.amountPerRun),
+    intervalSeconds: schedule.intervalSeconds,
+    nextRunAt: schedule.nextRunAt,
+    remainingRuns: schedule.remainingRuns,
+    status: schedule.status,
+    runs: (schedule.runs ?? []).map(mapScheduleRun),
+    createdAt: schedule.createdAt,
+    updatedAt: schedule.updatedAt,
+  };
+}
+
+function mapFundingPreview(
+  preview: ScheduleFundingPreview,
+): ScheduleFundingPreviewRecord {
+  return {
+    scheduleId: preview.scheduleId,
+    token: resolveTokenLabel(preview.tokenAddress),
+    tokenAddress: preview.tokenAddress,
+    requiredAmount: toTokenAmount(preview.requiredAmount),
+    availableBalance: toTokenAmount(preview.availableBalance),
+    shortfall: toTokenAmount(preview.shortfall),
+    sufficient: preview.sufficient,
+    nextRunAt: preview.nextRunAt,
+    checkedAt: preview.checkedAt,
+  };
+}
+
+async function requestScheduleEndpoint<T>(
+  path: string,
+  init: RequestInit,
+  timeoutMs: number,
+  authToken?: string | null,
+): Promise<T> {
+  const endpoints = resolveScheduleEndpointCandidates();
+  let lastError: Error | null = null;
+
+  for (const endpoint of endpoints) {
+    const response = await fetchWithTimeout(
+      `${endpoint}${path}`,
+      {
+        ...init,
+        headers: {
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          ...(init.headers ?? {}),
+        },
+      },
+      timeoutMs,
+    );
+
+    if (response.ok) {
+      return (await response.json()) as T;
+    }
+
+    if (response.status === 404) {
+      lastError = new Error(`Endpoint not found: ${endpoint}${path}`);
+      continue;
+    }
+
+    lastError = new Error(
+      `Schedule request failed (${response.status}) from ${endpoint}${path}`,
+    );
+  }
+
+  throw lastError ?? new Error("Failed to reach schedule backend.");
+}
+
+export async function fetchRecurringSchedules(
+  ownerPublicKey: string,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord[]> {
+  const params = new URLSearchParams({
+    owner: ownerPublicKey,
+    sort: "nextRunAt",
+    order: "asc",
+    limit: "100",
+  });
+  const payload = await requestScheduleEndpoint<
+    RecurringSchedule[] | ScheduleListResponse
+  >(`?${params.toString()}`, { method: "GET" }, timeoutMs, authToken);
+  const schedules = Array.isArray(payload) ? payload : payload.data ?? [];
+  return schedules.map(mapRecurringSchedule);
+}
+
+export async function createRecurringSchedule(
+  request: RecurringScheduleCreateRequest,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    "",
+    { method: "POST", body: JSON.stringify(request) },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function pauseRecurringSchedule(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    `/${scheduleId}/pause`,
+    { method: "POST" },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function cancelRecurringSchedule(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    `/${scheduleId}/cancel`,
+    { method: "POST" },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function fetchScheduleFundingPreview(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<ScheduleFundingPreviewRecord> {
+  const payload = await requestScheduleEndpoint<
+    ScheduleFundingPreview | ScheduleFundingPreviewResponse
+  >(`/${scheduleId}/funding-preview`, { method: "GET" }, timeoutMs, authToken);
+  const preview = "data" in payload && payload.data ? payload.data : payload;
+  return mapFundingPreview(preview as ScheduleFundingPreview);
 }
