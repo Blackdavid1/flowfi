@@ -1,162 +1,269 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
-import { cache } from '../lib/cache';
-import { emitDomainEvent } from '../lib/domain-events';
-
-const prisma = new PrismaClient();
+import { prisma } from '../lib/prisma';
+import { sseService } from '../services/sse.service';
+import { logger } from '../lib/logger';
 
 /**
- * User summary cache invalidation is driven by committed domain events.
+ * Session inventory for wallet-authenticated sessions.
  *
- * Mutations in this controller do NOT call `cache.del` inline. Instead, after a
- * successful mutation we emit a `user.summary.invalidated` domain event through
- * the post-commit helper in `../lib/domain-events`. The helper defers delivery
- * until the surrounding database transaction commits, so:
- *   - On commit: the event fires and the cached summary is invalidated.
- *   - On rollback: the event is discarded and the cache is left untouched,
- *     preventing stale responses after a failed mutation.
- *   - Duplicate events: invalidation is idempotent (deleting an already-absent
- *     key is a no-op), so repeated events are safe.
+ * Sessions are tracked by an opaque session identifier. We never persist
+ * signing secrets, private keys, or raw signatures in the session record.
+ * Only metadata required to display and revoke a session is stored.
  *
- * Cache consistency guarantee: a cached user summary is only ever invalidated
- * after the underlying write is durably committed. Readers may observe the
- * previous summary until the commit completes, but never a summary that
- * reflects a rolled-back write.
+ * Session expiry: sessions expire at `expiresAt`. Expired sessions are
+ * treated as inactive and cannot be used to authenticate. Revoked sessions
+ * (`revokedAt` set) are immediately invalid for both API and SSE access.
  */
 
-interface UserSummary {
-  id: string;
-  email: string;
-  name: string | null;
-  createdAt: Date;
-  updatedAt: Date;
+interface SessionMetadata {
+  userAgent?: string | null;
+  ipAddress?: string | null;
 }
 
-function summaryCacheKey(userId: string): string {
-  return `user:summary:${userId}`;
+interface SerializedSession {
+  id: string;
+  createdAt: Date;
+  lastSeenAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  userAgent: string | null;
+  ipAddress: string | null;
 }
 
-function toSummary(user: {
+function serializeSession(session: {
   id: string;
-  email: string;
-  name: string | null;
   createdAt: Date;
-  updatedAt: Date;
-}): UserSummary {
+  lastSeenAt: Date;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  userAgent?: string | null;
+  ipAddress?: string | null;
+}): SerializedSession {
   return {
-    id: user.id,
-    email: user.email,
-    name: user.name,
-    createdAt: user.createdAt,
-    updatedAt: user.updatedAt,
+    id: session.id,
+    createdAt: session.createdAt,
+    lastSeenAt: session.lastSeenAt,
+    expiresAt: session.expiresAt,
+    revokedAt: session.revokedAt,
+    userAgent: session.userAgent ?? null,
+    ipAddress: session.ipAddress ?? null,
   };
 }
 
-export async function registerUser(req: Request, res: Response): Promise<void> {
-  const { email, name, password } = req.body ?? {};
-
-  if (!email || typeof email !== 'string') {
-    res.status(400).json({ error: 'email is required' });
-    return;
+function getAuthenticatedWallet(req: Request): string | null {
+  const wallet = (req as Request & { wallet?: string }).wallet;
+  if (!wallet || typeof wallet !== 'string') {
+    return null;
   }
-  if (!password || typeof password !== 'string') {
-    res.status(400).json({ error: 'password is required' });
+  return wallet;
+}
+
+/**
+ * GET /api/user/sessions
+ * List active sessions for the authenticated wallet.
+ */
+export async function listSessions(req: Request, res: Response): Promise<void> {
+  const wallet = getAuthenticatedWallet(req);
+  if (!wallet) {
+    res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   try {
-    const user = await prisma.$transaction(async (tx) => {
-      const created = await tx.user.create({
-        data: {
-          email,
-          name: name ?? null,
-          password,
-        },
-      });
-
-      // Emit through the post-commit helper, passing the transaction client so
-      // the event is only delivered after this transaction commits.
-      await emitDomainEvent(
-        'user.summary.invalidated',
-        { userId: created.id },
-        tx,
-      );
-
-      return created;
+    const now = new Date();
+    const sessions = await prisma.walletSession.findMany({
+      where: {
+        walletAddress: wallet,
+        revokedAt: null,
+        expiresAt: { gt: now },
+      },
+      orderBy: { lastSeenAt: 'desc' },
+      select: {
+        id: true,
+        createdAt: true,
+        lastSeenAt: true,
+        expiresAt: true,
+        revokedAt: true,
+        userAgent: true,
+        ipAddress: true,
+      },
     });
 
-    res.status(201).json(toSummary(user));
-  } catch (err) {
-    res.status(500).json({ error: 'failed to register user' });
+    res.status(200).json({
+      sessions: sessions.map(serializeSession),
+    });
+  } catch (error) {
+    logger.error('Failed to list wallet sessions', { error, wallet });
+    res.status(500).json({ error: 'Failed to list sessions' });
   }
 }
 
-export async function updateUser(req: Request, res: Response): Promise<void> {
-  const { id } = req.params;
-  const { email, name } = req.body ?? {};
+/**
+ * DELETE /api/user/sessions/:sessionId
+ * Revoke a session belonging to the authenticated wallet.
+ */
+export async function revokeSession(req: Request, res: Response): Promise<void> {
+  const wallet = getAuthenticatedWallet(req);
+  if (!wallet) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
 
-  if (!id) {
-    res.status(400).json({ error: 'id is required' });
+  const { sessionId } = req.params;
+  if (!sessionId || typeof sessionId !== 'string') {
+    res.status(400).json({ error: 'Invalid session id' });
     return;
   }
 
   try {
-    const user = await prisma.$transaction(async (tx) => {
-      const updated = await tx.user.update({
-        where: { id },
-        data: {
-          ...(email !== undefined ? { email } : {}),
-          ...(name !== undefined ? { name } : {}),
-        },
-      });
-
-      // Emit through the post-commit helper, passing the transaction client so
-      // the event is only delivered after this transaction commits.
-      await emitDomainEvent(
-        'user.summary.invalidated',
-        { userId: updated.id },
-        tx,
-      );
-
-      return updated;
+    const session = await prisma.walletSession.findUnique({
+      where: { id: sessionId },
+      select: {
+        id: true,
+        walletAddress: true,
+        revokedAt: true,
+      },
     });
 
-    res.status(200).json(toSummary(user));
-  } catch (err: any) {
-    if (err?.code === 'P2025') {
-      res.status(404).json({ error: 'user not found' });
+    // Do not reveal whether a session exists for another wallet.
+    if (!session || session.walletAddress !== wallet) {
+      res.status(404).json({ error: 'Session not found' });
       return;
     }
-    res.status(500).json({ error: 'failed to update user' });
+
+    if (session.revokedAt) {
+      // Idempotent: already revoked.
+      res.status(200).json({ id: session.id, revokedAt: session.revokedAt });
+      return;
+    }
+
+    const revokedAt = new Date();
+    const updated = await prisma.walletSession.update({
+      where: { id: session.id },
+      data: { revokedAt },
+      select: { id: true, revokedAt: true },
+    });
+
+    // Immediately close any SSE connections tied to this session.
+    try {
+      sseService.revokeSessionConnections(session.id);
+    } catch (sseError) {
+      logger.error('Failed to revoke SSE connections for session', {
+        error: sseError,
+        sessionId: session.id,
+      });
+    }
+
+    res.status(200).json({ id: updated.id, revokedAt: updated.revokedAt });
+  } catch (error) {
+    logger.error('Failed to revoke wallet session', { error, wallet, sessionId });
+    res.status(500).json({ error: 'Failed to revoke session' });
   }
 }
 
-export async function getUserSummary(req: Request, res: Response): Promise<void> {
-  const { id } = req.params;
+/**
+ * GET /api/user/sessions/:sessionId
+ * Get a single session belonging to the authenticated wallet.
+ */
+export async function getSession(req: Request, res: Response): Promise<void> {
+  const wallet = getAuthenticatedWallet(req);
+  if (!wallet) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
 
-  if (!id) {
-    res.status(400).json({ error: 'id is required' });
+  const { sessionId } = req.params;
+  if (!sessionId || typeof sessionId !== 'string') {
+    res.status(400).json({ error: 'Invalid session id' });
     return;
   }
 
   try {
-    const key = summaryCacheKey(id);
-    const cached = await cache.get(key);
-    if (cached) {
-      res.status(200).json(JSON.parse(cached));
+    const session = await prisma.walletSession.findUnique({
+      where: { id: sessionId },
+      select: {
+        id: true,
+        walletAddress: true,
+        createdAt: true,
+        lastSeenAt: true,
+        expiresAt: true,
+        revokedAt: true,
+        userAgent: true,
+        ipAddress: true,
+      },
+    });
+
+    if (!session || session.walletAddress !== wallet) {
+      res.status(404).json({ error: 'Session not found' });
       return;
     }
 
-    const user = await prisma.user.findUnique({ where: { id } });
-    if (!user) {
-      res.status(404).json({ error: 'user not found' });
-      return;
-    }
-
-    const summary = toSummary(user);
-    await cache.set(key, JSON.stringify(summary));
-    res.status(200).json(summary);
-  } catch (err) {
-    res.status(500).json({ error: 'failed to load user summary' });
+    res.status(200).json({ session: serializeSession(session) });
+  } catch (error) {
+    logger.error('Failed to get wallet session', { error, wallet, sessionId });
+    res.status(500).json({ error: 'Failed to get session' });
   }
 }
+
+/**
+ * POST /api/user/sessions/revoke-all
+ * Revoke all active sessions for the authenticated wallet, optionally
+ * keeping the current session.
+ */
+export async function revokeAllSessions(req: Request, res: Response): Promise<void> {
+  const wallet = getAuthenticatedWallet(req);
+  if (!wallet) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const keepSessionId =
+    typeof req.body?.keepSessionId === 'string' ? req.body.keepSessionId : null;
+
+  try {
+    const now = new Date();
+    const activeSessions = await prisma.walletSession.findMany({
+      where: {
+        walletAddress: wallet,
+        revokedAt: null,
+        expiresAt: { gt: now },
+        ...(keepSessionId ? { id: { not: keepSessionId } } : {}),
+      },
+      select: { id: true },
+    });
+
+    const revokedAt = new Date();
+    if (activeSessions.length > 0) {
+      await prisma.walletSession.updateMany({
+        where: { id: { in: activeSessions.map((s) => s.id) } },
+        data: { revokedAt },
+      });
+
+      for (const session of activeSessions) {
+        try {
+          sseService.revokeSessionConnections(session.id);
+        } catch (sseError) {
+          logger.error('Failed to revoke SSE connections for session', {
+            error: sseError,
+            sessionId: session.id,
+          });
+        }
+      }
+    }
+
+    res.status(200).json({
+      revokedCount: activeSessions.length,
+      revokedAt,
+    });
+  } catch (error) {
+    logger.error('Failed to revoke all wallet sessions', { error, wallet });
+    res.status(500).json({ error: 'Failed to revoke sessions' });
+  }
+}
+
+export const userController = {
+  listSessions,
+  getSession,
+  revokeSession,
+  revokeAllSessions,
+};
