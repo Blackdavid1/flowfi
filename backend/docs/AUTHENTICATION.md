@@ -213,6 +213,19 @@ Returned when a request body, path parameter, or query parameter fails schema va
 }
 ```
 
+### 403 Forbidden - Signing Denied
+
+Returned when a signer policy denies a custodial signing action (including the default deny-all policy).
+
+```json
+{
+  "error": "Forbidden",
+  "code": "SIGNING_DENIED",
+  "message": "Signing action denied by signer policy",
+  "requestId": "b1f2c3d4-..."
+}
+```
+
 ### 403 Forbidden - Wallet Scope Violation
 
 Returned when an authenticated wallet attempts to read or mutate a resource it does not own. The response does not reveal whether the resource exists.

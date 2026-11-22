@@ -7,8 +7,21 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 
-interface StreamEvent {
+// Versioned FlowFi event envelope. `version` lets partners evolve safely.
+const SUPPORTED_EVENT_VERSION = 1;
+
+interface StreamEventEnvelope {
+  id: string; // unique event id, used for idempotency
+  version: number; // envelope schema version
   type: 'created' | 'topped_up' | 'withdrawn' | 'cancelled' | 'completed';
+  cursor: string; // monotonic cursor for recovery
+  signature?: string; // HMAC/signature over the canonical payload
+  data: any;
+  timestamp: number;
+}
+
+interface StreamEvent {
+  type: StreamEventEnvelope['type'];
   data: any;
   timestamp: number;
 }
@@ -19,6 +32,11 @@ interface UseStreamEventsOptions {
   subscribeToAll?: boolean;
   autoReconnect?: boolean;
   maxRetryDelay?: number;
+  // Optional verifier: return true when the signature is valid.
+  verifySignature?: (envelope: StreamEventEnvelope) => boolean | Promise<boolean>;
+  // Persist/restore the last processed cursor (e.g. localStorage).
+  loadCursor?: () => string | null;
+  saveCursor?: (cursor: string) => void;
 }
 
 interface UseStreamEventsReturn {
@@ -227,6 +245,9 @@ export function useStreamEvents(
     subscribeToAll = false,
     autoReconnect = true,
     maxRetryDelay = 30000,
+    verifySignature,
+    loadCursor,
+    saveCursor,
   } = options;
 
   const [events, setEvents] = useState<StreamEvent[]>([]);
@@ -341,6 +362,17 @@ export function StreamDashboard({ streamId, walletAddress }: { streamId: string;
   const { data, loading, error } = useStreamState({ streamId, walletAddress });
   const { events, connected, reconnecting, clearEvents } = useStreamEvents({
     streamIds: [streamId],
+    // Verify signatures with your shared secret / public key.
+    verifySignature: async (envelope) => {
+      const res = await fetch('/api/verify', {
+        method: 'POST',
+        body: JSON.stringify(envelope),
+      });
+      return res.ok;
+    },
+    // Persist the cursor so restarts resume where they left off.
+    loadCursor: () => localStorage.getItem('flowfi:cursor'),
+    saveCursor: (cursor) => localStorage.setItem('flowfi:cursor', cursor),
   });
   const prefersReducedMotion = usePrefersReducedMotion();
 

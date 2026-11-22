@@ -1,60 +1,73 @@
 # FlowFi Backend
 
-This is the Node.js / Express backend for FlowFi. It provides the REST API for the frontend, indexes on-chain events from the Stellar network, and serves real-time updates via Server-Sent Events (SSE).
+This document describes the backend services, their public interfaces, and the
+operational contracts they must uphold. Keep it in sync with code changes that
+alter externally observable behavior.
 
-## Scripts
+## Accounting export adapters
 
-- `npm install`: Installs dependencies.
-- `npm run dev`: Starts the development server using nodemon.
-  
-  > **Note:** nodemon watches only the `src/` directory for changes. Tests live in the `tests/` directory (outside the watch scope), so they never trigger server reloads. If tests were ever colocated inside `src/` in the future, add ignore patterns (e.g. `src/**/*.test.ts`) to nodemon.json to prevent unwanted restarts.
-- `npm run build`: Compiles TypeScript to JavaScript.
-- `npm start`: Runs the compiled server.
-- `npm run db:push`: Pushes Prisma schema changes to the database.
+The accounting export adapters map FlowFi stream and event records to a
+documented accounting interchange format (a JSON journal of balanced entries)
+without losing ledger or transaction provenance. They live under
+`backend/src/integrations/accounting/` and are consumed by the export job and
+partner integrations.
 
-## Environment Variables
+### Stable identifiers
 
-Create a `.env` file with the following variables:
+Every exported entry carries stable identifiers so downstream ledgers can
+deduplicate and reconcile across re-exports:
 
-```env
-DATABASE_URL=postgresql://flowfi:flowfi_dev_password@localhost:5433/flowfi?schema=public
-PORT=3001
-SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
-NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-API_BASE_URL=https://api.staging.flowfi.io
-```
+- `streamId` — the FlowFi stream identifier (unchanged across lifecycle).
+- `eventId` — the originating event identifier; unique per lifecycle event.
+- `entryId` — deterministic, derived from `(streamId, eventId, entryKind)` so
+  re-running an export produces identical identifiers.
+- `txHash` / `network` — chain provenance, preserved verbatim when present.
 
-- `API_BASE_URL`: Overrides the Swagger UI server URL for the deployed environment (e.g., staging or production). When set, Swagger UI targets `<API_BASE_URL>/v1` instead of the hardcoded defaults.
-- `DATABASE_URL` is required before the backend starts. Production additionally requires `JWT_SECRET`, `KEEPER_SECRET_KEY`, `ADMIN_PUBLIC_KEY`, `SOROBAN_RPC_URL`, `STELLAR_NETWORK`, `STREAM_CONTRACT_ID`, `CORS_ALLOWED_ORIGINS`, and an HTTPS `API_BASE_URL`. Production startup rejects placeholders, weak signing keys, invalid Stellar keys, network mismatches, wildcard/insecure origins, and enabled sandbox mode. `SOROBAN_RPC_URLS` may add pool failover endpoints but does not replace the primary URL.
+Identifiers are never regenerated from timestamps or array positions.
 
-## Prisma Database
+### Rounding
 
-We use Prisma as our ORM to interact with PostgreSQL.
+- All monetary amounts are exported as integer minor units (e.g. cents) using
+  the token/asset decimals recorded on the stream.
+- Rounding is half-up (`ROUND_HALF_UP`) applied once, at the point of
+  conversion from on-chain base units to the export minor unit.
+- No intermediate rounding is performed; sums are computed in base units and
+  converted once to avoid drift.
+- The rounding mode and scale are recorded on each export batch header.
 
-- Schema is located at `prisma/schema.prisma`.
-- Configuration (schema path, migrations path, datasource URL) is defined in `prisma.config.ts`.
-- Run `npx prisma studio` to view the database through a web UI.
+### Fees
 
-### `prisma.config.ts` vs `prisma/schema.prisma`
+- Protocol and network fees are exported as separate debit entries linked to
+  the parent stream entry via `entryId`/`parentEntryId`.
+- Fees are never netted into the principal amount; provenance of each fee is
+  retained (`feeKind`, `txHash`).
+- Zero-fee events emit no fee entry.
 
-There are two Prisma files, and they do different jobs:
+### Timezone
 
-| File | Owns |
-| ---- | ---- |
-| `prisma/schema.prisma` | The **data model** — models, enums, relations, the `datasource` and `generator` blocks. This is what `prisma generate` turns into the client. |
-| `prisma.config.ts` | The **Prisma CLI configuration** — where the CLI looks for things and how it connects when you run `prisma generate`, `prisma migrate`, `prisma db push`, or `prisma studio`. |
+- All timestamps are normalized to UTC and exported as RFC 3339 with a `Z`
+  suffix.
+- The source timezone (if any) is not inferred; records without a timestamp
+  are rejected rather than defaulted.
+- Export batch headers record `timezone: "UTC"`.
 
-`prisma.config.ts` exists as a separate file because it is TypeScript that Node evaluates before the CLI runs, so it can do things `schema.prisma` cannot — most importantly read environment variables. Prisma 7 (this project is on `prisma@^7.4.1`) no longer auto-loads `.env` for CLI commands, which is why the file starts with `import "dotenv/config"`.
+### Reversal entries
 
-What it currently sets:
+- Reversals (cancellations, refunds, failed settlements) emit a compensating
+  entry that references the original via `reversesEntryId`.
+- Reversal entries negate the original amount and reuse the original
+  `streamId`/`txHash` provenance; they never mutate the original entry.
+- A reversal without a resolvable original entry is a hard failure.
 
-- `schema: "prisma/schema.prisma"` — path to the schema, so CLI commands work from the `backend/` directory without a `--schema` flag.
-- `migrations.path: "prisma/migrations"` — where migration folders are read from and written to.
-- `datasource.url: process.env["DATABASE_URL"]` — the connection string the CLI uses.
+### Testing
 
-### Seeding the database
+- Golden-file tests under `backend/test/integrations/accounting/golden/` cover
+  representative lifecycle histories (create → fund → withdraw → cancel,
+  fee-bearing settlements, and reversals).
+- Focused unit tests cover boundary cases: zero amounts, maximum decimals,
+  missing timestamps, unresolvable reversals, and duplicate re-exports.
 
-`prisma/seed.ts` populates the database with demo fixtures for local development. Run it with:
+## Compatibility
 
 ```bash
 npm run prisma:seed
